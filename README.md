@@ -313,3 +313,65 @@ DICAN_Project/
 - "Base Session에서는 Ground Truth Concept(Mask)을 사용하여 Reasoning Head의 신뢰성을 확보하고, Incremental Session에서는 이를 보존했다."
 
 자신감을 가지셔도 됩니다. DICAN은 **"CBM의 철학을 가장 잘 지키면서도, 현실적인 제약(Few-shot, DIL)을 해결하기 위해 똑똑하게 변형된 구조"**입니다. 논리적으로 빈틈이 없습니다!
+
+윤영님, `README.md`에 설계된 DICAN의 학습 전략을 완벽하게 구현하기 위한 `utils/losses.py` 코드를 작성해 드립니다.
+
+이 파일은 **Base Session(정답 마스크 존재)**과 **Incremental Session(마스크 없음, Few-shot)**이라는 두 가지 상이한 상황을 모두 처리해야 하므로, 논리적인 분기가 매우 중요합니다.
+
+---
+
+### 1. 필요한 Loss Function의 종류와 논리적 근거
+
+`README.md`의 설계에 따라 다음 4가지 Loss가 구현되어야 합니다.
+
+#### **A. Base Session용 (Strong Supervision)**
+
+이때는 "정답"을 알고 있으므로 모델이 정답을 모사하도록 학습합니다.
+
+1. **Segmentation Loss ()**:
+
+- **논리:** Backbone이 병변의 위치를 정확히 파악해야 나중에 마스크 없이도 특징을 잘 뽑습니다.
+- **구현:** Pixel-wise Binary Cross Entropy (BCE).
+
+2. **Classification Loss ()**:
+
+- **논리:** 추출된 Concept(프로토타입)을 기반으로 Head가 정확한 DR 등급을 맞추도록 학습합니다.
+- **구현:** Standard Cross Entropy.
+
+#### **B. Incremental Session용 (Weak Supervision & Alignment)**
+
+이때는 "정답 마스크"가 없으므로, **"의학적 규칙(Logic)"**과 **"진단 결과(Label)"**를 단서로 역추적하여 학습합니다.
+
+1. **Alignment Loss ()**:
+
+- **논리:** "등급이 높으면(Severe), 반드시 출혈(Hemorrhage)이 있어야 한다"는 규칙을 이용합니다. 라벨()을 보고 **"있어야 할 Concept"**을 정의한 뒤, Projector가 그 Concept의 Prototype과 가까운 특징을 내놓도록 강제합니다.
+- **구현:** Logic-guided BCE Loss (라벨로부터 가상의 Concept Target 생성).
+
+2. **Ordinal Loss ()**:
+
+- **논리:** DR은 심각도 순서()가 있습니다. Grade 4를 0으로 예측하는 것은 3으로 예측하는 것보다 훨씬 나쁩니다. 특히 **미진단(Under-diagnosis)**에 더 큰 페널티를 주어 안전한 모델을 만듭니다.
+- **구현:** Cost-Sensitive Cross Entropy (예측값과 정답의 차이에 비례하여 가중치 부여).
+
+3. **Sparsity Loss ()**:
+
+- **논리:** 정상(Grade 0)인 이미지는 어떤 병변 Concept도 활성화되면 안 됩니다.
+- **구현:** 라벨이 0일 때, 모든 Concept Score의 합을 0으로 만드는 L1 Penalty.
+
+### 💡 코드의 핵심 논리 분석 (Defense Logic)
+
+이 코드가 왜 DICAN의 철학을 대변하는지 설명해 드립니다.
+
+1. **`concept_rule_matrix` (의학적 지식 주입):**
+
+- Incremental Session에는 마스크가 없습니다. 대신 **"Grade 2라면 출혈이 있어야 한다"**는 의학적 사실(Prior Knowledge)을 `concept_rule_matrix`로 정의하여 모델에 주입했습니다.
+- 이것이 바로 **Weakly-Supervised Alignment**의 핵심이며, Projector가 아무렇게나 학습되는 것을 방지하는 가이드라인 역할을 합니다.
+
+2. **`loss_ordinal` (미진단 방지):**
+
+- 단순 `CrossEntropy`를 쓰지 않고, `penalty_weights`를 곱해주는 방식을 택했습니다.
+- `torch.relu(labels - pred_labels)` 수식은 **"실제보다 낮게 예측했을 때만"** 양수 값을 반환합니다. 즉, 과잉 진단(Over-diagnosis)보다 **미진단(Under-diagnosis)을 훨씬 더 엄격하게 처벌**하여 의료 AI의 안전성을 확보했습니다.
+
+3. **`loss_sparsity` (Normal 데이터 처리):**
+
+- DR 데이터의 90%는 정상(Level 0)입니다. 이 데이터들은 병변 학습에 도움이 안 된다고 생각할 수 있지만, 여기서는 **"Negative Sample"**로 활용했습니다.
+- "정상이면 아무것도 뜨지 마라"는 제약(`L1 Loss`)을 통해, Projector가 노이즈를 병변으로 착각하는 환각(Hallucination) 현상을 억제했습니다.
