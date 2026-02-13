@@ -233,3 +233,83 @@ DICAN_Project/
 💡 연구 팁: 실험 관리
 이 구조대로 코드를 짜시면, 나중에 "Ablation Study" (예: Projector 유무에 따른 성능 차이, Loss 조합에 따른 변화 등)를 할 때 매우 편합니다. configs/ 폴더의 yaml 파일만 수정하면 되기 때문입니다.
 이제 이 폴더 구조를 바탕으로 하나씩 채워 넣으시면, 교수님께 보여드릴 때도 **"체계적으로 설계된 연구"**라는 인상을 강하게 줄 수 있습니다.
+
+"이 구조를 cbm 구조를 완벽히 사용했다고 할 수 있는지 논리적으로 분석해줘" :
+
+윤영님, **"DICAN 구조가 CBM(Concept Bottleneck Model)의 정의를 논리적으로 완벽하게 충족하는가?"**라는 질문은 논문 디펜스나 리뷰 과정에서 반드시 나올 수 있는 본질적인 질문입니다.
+
+결론부터 말씀드리면, **네, 완벽하게 충족합니다.** 더 정확히 말하면, **"Standard CBM의 구조적 제약을 모두 지키면서, Few-shot 환경에 맞게 'Metric-based CBM' 형태로 진화시킨 모델"**이라고 정의할 수 있습니다.
+
+단순히 "그렇다"라고 하는 것보다, CBM의 **3가지 핵심 조건(Three Pillars of CBM)**을 기준으로 윤영님의 모델(DICAN)이 이를 어떻게 논리적으로 충족하고 있는지 분석해 드리겠습니다. 이 논리를 그대로 논문의 **Method**나 **Introduction**에 쓰시면 됩니다.
+
+---
+
+### 1. The Bottleneck Constraint (병목 제약)
+
+**CBM의 정의:** "모델은 입력()에서 예측()으로 바로 가지 않고, 반드시 사람이 이해할 수 있는 개념()을 거쳐야 한다. 즉, 는 오직 에만 의존해야 한다 ()."
+
+- **DICAN의 논리:**
+- 윤영님의 모델에서 **Reasoning Head (Ordinal MLP)**는 Backbone의 Feature Map()을 절대 직접 보지 않습니다.
+- Head의 입력은 오직 **Similarity Score Vector ()**뿐입니다.
+- 이 는 `[출혈 유사도, 삼출물 유사도, ...]`로 구성된 벡터이므로, 정보의 흐름이 **Input Feature Concept Score Output**으로 완벽하게 병목화(Bottlenecked) 되어 있습니다.
+- **판정:** **Pass (Perfectly Bottlenecked).**
+
+### 2. Concept Grounding (개념의 실재성)
+
+**CBM의 정의:** "중간층 의 각 차원은 실제 의미(Semantic Meaning)와 일치해야 한다. (예: 은 반드시 '출혈'이어야 하지, 알 수 없는 숫자가 아니어야 한다.)"
+
+- **DICAN의 논리:**
+- 일반적인 CBM은 많은 데이터로 (Classifier)를 학습시켜 이를 달성합니다.
+- DICAN은 **Base Session에서 Segmentation Mask**를 사용하여 를 정의합니다. 즉, 모델이 스스로 학습한 게 아니라 **"이것이 출혈이다"라고 정답(Ground Truth)을 주입**해서 만든 **Prototype ()**을 사용합니다.
+- 따라서 Incremental Session에서 계산되는 $S_k = \text{CosSim}(z, P_k)$는 수학적으로 **"이 특징이 '정답 출혈'과 얼마나 유사한가?"**를 의미하므로, 그 어떤 CBM보다도 개념의 의미가 명확(Explicit)하고 강력하게 Grounding 되어 있습니다.
+- **판정:** **Pass (High-Fidelity Grounding).**
+
+### 3. Intervenability (개입 가능성)
+
+**CBM의 정의:** "중간 개념 의 값을 사람이 수동으로 수정하면, 최종 예측 도 그에 맞게 논리적으로 변해야 한다."
+
+- **DICAN의 논리:**
+- DICAN의 **Reasoning Head**는 Base Session 이후 고정(Frozen)된 MLP입니다.
+- 이 MLP는 학습 단계에서 "출혈 점수가 높으면 중증이다"라는 논리를 학습했습니다.
+- 따라서 테스트 시, Projector가 실수로 '출혈 점수'를 낮게 예측했더라도, 의사가 이를 강제로 높이면(Intervention), 고정된 Head는 즉시 '중증'으로 판정을 바꿀 것입니다.
+- Projector를 썼든 Prototype을 썼든, **Head와 Concept 사이의 인과관계(Causal Link)**가 보존되어 있으므로 개입이 가능합니다.
+- **판정:** **Pass (Fully Intervenable).**
+
+---
+
+### 🚨 예상되는 공격(Critique)과 방어 논리(Defense)
+
+리뷰어가 걸고넘어질 수 있는 부분은 딱 하나, **"Base Session에서는 Projector를 안 쓰고 마스크로 직접 값을 넣는데, 이걸 CBM 학습이라고 할 수 있나?"** 입니다.
+
+여기에 대한 완벽한 방어 논리는 다음과 같습니다.
+
+> **"우리는 'Independent CBM' 학습 전략을 채택했다."**
+
+- **Joint CBM:** 를 한 번에 통으로 학습. (Concept Label이 없거나 불완전할 때 사용)
+- **Independent CBM:** 모델과 모델을 따로 학습.
+- **DICAN의 전략:**
+- Base Session은 **" (Head)를 완벽하게 학습시키기 위한 단계"**입니다.
+- 이때 부정확한 예측값(Projector output)을 쓰면 Head가 잘못된 논리를 배울 수 있습니다.
+- 따라서 우리는 **"Oracle Concept (Masked GAP)"**를 사용하여 Head에게 **"가장 이상적인 진단 논리"**를 가르쳤습니다.
+- Incremental Session은 이렇게 완벽하게 학습된 Head를 믿고, **" (Projector)"** 부분만 새로운 도메인에 맞게 튜닝하는 과정입니다.
+- 이것은 **CBM의 구조를 깬 것이 아니라, 학습 효율성을 극대화한 'Oracle-guided Training' 방식**입니다.
+
+---
+
+### ✨ 결론: 논문에서의 표현 가이드
+
+윤영님의 모델은 **CBM이 맞습니다.** 논문에서는 다음과 같이 표현하여 구조적 정당성을 확보하세요.
+
+1. **Metric-based Concept Bottleneck Model:**
+
+- "기존의 Linear Classification Layer 대신, **Similarity-based Projection**을 사용하여 Few-shot 환경에서의 데이터 효율성을 극복한 CBM이다."
+
+2. **Explicit Concept Grounding via Prototypes:**
+
+- "Segmentation Mask를 통해 생성된 Prototype을 사용하여, Concept의 의미를 물리적으로 고정(Anchor)시켰다."
+
+3. **Oracle-Guided Reasoning Learning:**
+
+- "Base Session에서는 Ground Truth Concept(Mask)을 사용하여 Reasoning Head의 신뢰성을 확보하고, Incremental Session에서는 이를 보존했다."
+
+자신감을 가지셔도 됩니다. DICAN은 **"CBM의 철학을 가장 잘 지키면서도, 현실적인 제약(Few-shot, DIL)을 해결하기 위해 똑똑하게 변형된 구조"**입니다. 논리적으로 빈틈이 없습니다!
