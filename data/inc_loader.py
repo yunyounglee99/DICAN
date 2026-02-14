@@ -4,44 +4,45 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import random
+from sklearn.model_selection import train_test_split
 
 class UnifiedIncrementalDataset(Dataset):
     """
-    [Incremental Session용 통합 데이터셋]
-    각 세션(병원/도메인)별로 서로 다른 데이터 소스를 하나의 인터페이스로 통합합니다.
+    [Incremental Session용 통합 데이터셋 - 최종 수정 (File-based)]
+    - 모든 데이터셋(APTOS, Messidor-2, DRAC22)을 압축 해제된 폴더에서 로드합니다.
+    - ZIP 관련 복잡한 로직을 제거하고 'mode="file"'로 통일했습니다.
+    - APTOS는 train.csv만 존재하므로, 이를 Train/Val/Test로 내부 분할합니다.
     """
-    def __init__(self, session_id, data_dir, img_size=224, shot=10, split='train'):
+    def __init__(self, session_id, data_dir, img_size=224, shot=10, split='train', seed=42):
         """
         Args:
-            session_id (int): 1~5 (세션 번호)
-            data_dir (str): 해당 데이터셋이 저장된 로컬 루트 경로
-            img_size (int): 리사이징 크기
-            shot (int): Few-shot 학습을 위한 샘플 수 (None이면 전체 사용)
+            session_id (int): 1(APTOS), 2(Messidor-2), 3(DRAC22)
+            data_dir (str): 'DICAN_DATASETS' 폴더 경로
+            split (str): 'train', 'val', 'test'
         """
         self.session_id = session_id
         self.data_dir = data_dir
         self.img_size = img_size
         self.split = split
+        self.seed = seed
         self.data_list = []
         
-        # 1. 세션별 데이터 로드 로직
-        if session_id == 1: # DRAC22_RNV
-            self._load_drac22()
-        elif session_id == 2: # RFMiD
-            self._load_rfmid()
-        elif session_id == 3: # PRIME-FP20 (Local)
-            self._load_prime_fp20()
-        elif session_id == 4: # APTOS 2019
+        # 1. 세션별 데이터 로드
+        if session_id == 1: # APTOS 2019
             self._load_aptos()
-        elif session_id == 5: # EYEPACS
-            self._load_eyepacs()
-        
-        # 2. Few-shot 샘플링 (K-shot)
-        if shot is not None and split == 'train':
+        elif session_id == 2: # Messidor-2
+            self._load_messidor2()
+        elif session_id == 3: # DRAC22
+            self._load_drac22()
+        else:
+            raise ValueError(f"Unknown session_id: {session_id}")
+            
+        # 2. Few-shot 샘플링 (Train set에만 적용)
+        # Test/Val 셋은 전체 데이터를 사용하여 공정한 평가를 함
+        if split == 'train' and shot is not None:
             self._apply_few_shot(shot)
-
-        # 3. 전처리 (ImageNet 기준)
+        
+        # 3. 전처리
         self.transform = transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
@@ -49,91 +50,292 @@ class UnifiedIncrementalDataset(Dataset):
         ])
 
     def _apply_few_shot(self, shot):
-        """등급별로 K-shot만큼 균등하게 샘플링"""
+        """클래스별 균등 샘플링 (K-shot)"""
         df = pd.DataFrame(self.data_list)
-        few_shot_list = []
-        for g in range(5): # 0~4 등급
-            subset = df[df['label'] == g]
+        few_shot_data = []
+        
+        for grade in range(5):
+            subset = df[df['label'] == grade]
             if len(subset) > 0:
-                sampled = subset.sample(n=min(shot, len(subset)), random_state=42)
-                few_shot_list.extend(sampled.to_dict('records'))
-        self.data_list = few_shot_list
-        print(f"   -> Few-shot applied: Total {len(self.data_list)} samples for Session {self.session_id}")
+                n_samples = min(len(subset), shot)
+                sampled = subset.sample(n=n_samples, random_state=self.seed)
+                few_shot_data.extend(sampled.to_dict('records'))
+                
+        self.data_list = few_shot_data
+        print(f"[{self.split.upper()}] Session {self.session_id}: Few-shot applied -> {len(self.data_list)} samples.")
 
-    # --- 각 데이터셋별 파싱 로직 ---
-    def _load_drac22(self):
-        # DRAC22 구조에 맞게 수정 (보통 csv 라벨 파일 존재)
-        csv_path = os.path.join(self.data_dir, "DRAC22_Grading_Labels.csv")
-        df = pd.read_csv(csv_path)
-        for _, row in df.iterrows():
-            self.data_list.append({
-                "path": os.path.join(self.data_dir, "images", row['image_name']),
-                "label": int(row['grade'])
-            })
+    def _split_data(self, all_data):
+        """
+        전체 데이터 리스트를 Train(80%) / Val(10%) / Test(10%)로 분할
+        """
+        # Stratified Split을 위해 라벨 추출
+        labels = [x['label'] for x in all_data]
 
-    def _load_rfmid(self):
-        # RFMiD는 다중 질환 데이터셋이므로 DR 등급만 추출
-        csv_path = os.path.join(self.data_dir, "Training_Labels.csv")
-        df = pd.read_csv(csv_path)
-        # DR 관련 컬럼(예: 'DR')이 1인 경우만 가져오거나 등급 매핑 필요
-        for _, row in df.iterrows():
-            self.data_list.append({
-                "path": os.path.join(self.data_dir, "images", f"{row['ID']}.png"),
-                "label": int(row['DR_Grade']) # 데이터셋 컬럼명에 맞춰 수정
-            })
+        # 1. Train / Temp 분할 (8:2)
+        train_data, temp_data = train_test_split(
+            all_data, test_size=0.2, random_state=self.seed, stratify=labels
+        )
+        
+        # Temp 데이터의 라벨 추출
+        temp_labels = [x['label'] for x in temp_data]
 
-    def _load_prime_fp20(self):
-        # 로컬 저장된 PRIME-FP20 로드 (UWF 이미지)
-        img_dir = os.path.join(self.data_dir, "images")
-        for img_name in os.listdir(img_dir):
-            if img_name.endswith(('.jpg', '.png')):
-                # 파일명에서 라벨 추출하는 로직 또는 별도 txt/csv 로드
-                # 예: ID_grade.jpg 형태 가정
-                label = int(img_name.split('_')[1].split('.')[0])
-                self.data_list.append({
-                    "path": os.path.join(img_dir, img_name),
-                    "label": label
-                })
+        # 2. Temp를 Val / Test 분할 (1:1 -> 전체의 10%:10%)
+        val_data, test_data = train_test_split(
+            temp_data, test_size=0.5, random_state=self.seed, stratify=temp_labels
+        )
+        
+        if self.split == 'train':
+            return train_data
+        elif self.split == 'val':
+            return val_data
+        else: # test
+            return test_data
+
+    # =========================================================
+    # 데이터셋별 로딩 로직 (폴더 구조 반영)
+    # =========================================================
 
     def _load_aptos(self):
-        csv_path = os.path.join(self.data_dir, "train.csv")
+        """
+        [Structure Check]
+        aptos/
+          aptos2019-blindness-detection/
+            train_images/
+            train.csv
+        """
+        root = os.path.join(self.data_dir, "aptos", "aptos2019-blindness-detection")
+        csv_path = os.path.join(root, "train.csv")
+        img_dir = os.path.join(root, "train_images")
+        
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"APTOS CSV not found: {csv_path}")
+
         df = pd.read_csv(csv_path)
+        all_data = []
+        
         for _, row in df.iterrows():
-            self.data_list.append({
-                "path": os.path.join(self.data_dir, "train_images", f"{row['id_code']}.png"),
+            # id_code + .png
+            img_name = f"{row['id_code']}.png"
+            all_data.append({
+                "path": os.path.join(img_dir, img_name),
                 "label": int(row['diagnosis'])
             })
+            
+        # Train.csv 하나를 쪼개서 사용
+        self.data_list = self._split_data(all_data)
 
-    def _load_eyepacs(self):
-        csv_path = os.path.join(self.data_dir, "trainLabels.csv")
+    def _load_messidor2(self):
+            """
+            [Structure Check]
+            messidor-2/
+              IMAGES/ (압축 해제된 폴더)
+              messidor_data.csv
+            """
+            root = os.path.join(self.data_dir, "messidor-2")
+            img_dir = os.path.join(root, "IMAGES") 
+            csv_path = os.path.join(root, "messidor_data.csv")
+            
+            if not os.path.exists(csv_path):
+                raise FileNotFoundError(f"Messidor-2 CSV not found: {csv_path}")
+
+            df = pd.read_csv(csv_path)
+            
+            # [수정 1] 라벨(adjudicated_dr_grade)이 비어있는 행(NaN) 제거
+            # 빈 값은 학습에 쓸 수 없으므로 무시합니다.
+            original_len = len(df)
+            df = df.dropna(subset=['adjudicated_dr_grade'])
+            if len(df) < original_len:
+                print(f"  [Messidor-2] Dropped {original_len - len(df)} rows with missing labels.")
+
+            all_data = []
+            
+            for _, row in df.iterrows():
+                img_id = row['image_id']
+                # Messidor 이미지는 보통 .jpg 형식이지만 CSV엔 확장자가 없는 경우가 많음
+                fname = str(img_id)
+                if not fname.lower().endswith(('.jpg', '.png', '.jpeg')):
+                    fname += ".jpg" 
+                
+                full_path = os.path.join(img_dir, fname)
+                
+                all_data.append({
+                    "path": full_path,
+                    # [수정 2] float -> int 안전하게 변환
+                    "label": int(float(row['adjudicated_dr_grade']))
+                })
+                
+            self.data_list = self._split_data(all_data)
+
+    def _load_drac22(self):
+        """
+        [Structure Check]
+        DRAC22/
+          C. Diabetic Retinopathy Grading/
+            1. Original Images/
+              a. Training Set/
+            2. Groundtruths/
+              a. DRAC2022_ ... Labels.csv
+        """
+        root = os.path.join(self.data_dir, "DRAC22", "C. Diabetic Retinopathy Grading")
+        gt_folder = os.path.join(root, "2. Groundtruths")
+        img_root = os.path.join(root, "1. Original Images", "a. Training Set")
+
+        # CSV 파일명 찾기
+        try:
+            csv_name = [f for f in os.listdir(gt_folder) if "Training Labels" in f and f.endswith(".csv")][0]
+            csv_path = os.path.join(gt_folder, csv_name)
+        except IndexError:
+            raise FileNotFoundError(f"DRAC22 Label CSV not found in {gt_folder}")
+        
         df = pd.read_csv(csv_path)
+        all_data = []
+        
         for _, row in df.iterrows():
-            self.data_list.append({
-                "path": os.path.join(self.data_dir, "train", f"{row['image']}.jpeg"),
-                "label": int(row['level'])
+            # [수정 3] Warning 해결: row[0] 대신 row.iloc[0] 사용
+            img_name = row.iloc[0] 
+            grade = int(row.iloc[1])
+            
+            all_data.append({
+                "path": os.path.join(img_root, img_name),
+                "label": grade
             })
+            
+        self.data_list = self._split_data(all_data)
 
     def __len__(self):
         return len(self.data_list)
 
     def __getitem__(self, idx):
         item = self.data_list[idx]
-        image = Image.open(item['path']).convert("RGB")
-        image = self.transform(image)
+        
+        try:
+            # 모든 데이터셋이 이제 일반 파일 경로를 사용
+            image = Image.open(item['path']).convert("RGB")
+        except Exception as e:
+            print(f"Error loading image {item['path']}: {e}")
+            # 에러 발생 시 검은색 이미지 반환 (학습 중단 방지)
+            image = Image.new('RGB', (self.img_size, self.img_size))
+
+        if self.transform:
+            image = self.transform(image)
+            
         return {
             "image": image,
             "label": torch.tensor(item['label'], dtype=torch.long),
             "session_id": self.session_id
         }
 
-def get_incremental_loader(session_id, data_root, batch_size=16, shot=10):
+def get_incremental_loader(session_id, data_root, mode='train', batch_size=16, shot=10):
     """
-    특정 세션의 데이터로더를 반환하는 함수.
-    Incremental Session은 소량의 데이터로 학습하므로 작은 batch_size를 권장합니다.
+    Args:
+        mode (str): 'train', 'val', 'test'
     """
+    # Test/Val 모드일 때는 Shot 제한 없이 전체 데이터 사용
+    current_shot = shot if mode == 'train' else None
+    
     dataset = UnifiedIncrementalDataset(
         session_id=session_id, 
         data_dir=data_root, 
-        shot=shot
+        shot=current_shot,
+        split=mode
     )
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    
+    return DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=(mode == 'train'), 
+        num_workers=4,
+        pin_memory=True
+    )
+
+if __name__ == "__main__":
+    import sys
+    
+    # -------------------------------------------------------------------------
+    # [사용자 설정] 실제 데이터셋이 있는 루트 폴더 경로로 수정해주세요.
+    # 예: '/Users/nyoung/DICAN_DATASETS'
+    DATA_ROOT = '/Volumes/Nyoungs_SSD/macbook/dev/datasets/DICAN_DATASETS' 
+    # -------------------------------------------------------------------------
+
+    print(f"[*] Testing Incremental Loader with DATA_ROOT: {DATA_ROOT}\n")
+    
+    if not os.path.exists(DATA_ROOT):
+        print(f"[Error] Directory not found: {DATA_ROOT}")
+        print("Please update 'DATA_ROOT' variable in the __main__ block.")
+        sys.exit(1)
+
+    # 테스트할 세션 ID 목록 (1: APTOS, 2: Messidor-2, 3: DRAC22)
+    session_map = {1: "APTOS 2019", 2: "Messidor-2", 3: "DRAC22"}
+    
+    for sid, name in session_map.items():
+        print(f"="*60)
+        print(f"Start Checking Session {sid}: {name}")
+        print(f"="*60)
+        
+        try:
+            # ----------------------------------------------------------------
+            # 1. Train Loader 테스트 (Few-shot 적용 확인)
+            # ----------------------------------------------------------------
+            SHOT_NUM = 5  # 테스트용으로 5-shot 설정 (총 데이터 약 25개 예상)
+            BATCH_SIZE = 4
+            
+            train_loader = get_incremental_loader(
+                session_id=sid, 
+                data_root=DATA_ROOT, 
+                mode='train', 
+                batch_size=BATCH_SIZE, 
+                shot=SHOT_NUM
+            )
+            
+            train_size = len(train_loader.dataset)
+            print(f"  [Train] Loader created.")
+            print(f"    -> Dataset size: {train_size} images")
+            print(f"    -> Expected size: <= {5 * SHOT_NUM} (5 classes * {SHOT_NUM} shot)")
+            
+            # 배치 로딩 시도 (이미지 파일 읽기 테스트)
+            batch = next(iter(train_loader))
+            images = batch['image']
+            labels = batch['label']
+            
+            print(f"    -> Batch Fetch Success!")
+            print(f"    -> Image Shape: {images.shape} (Batch, C, H, W)")
+            print(f"    -> Label Shape: {labels.shape}")
+            print(f"    -> Sample Labels: {labels.tolist()}")
+            
+            # Few-shot 검증
+            if train_size <= 5 * SHOT_NUM:
+                print("    -> [PASS] Few-shot sampling seems correct.")
+            else:
+                print("    -> [WARNING] Dataset size is larger than expected for few-shot.")
+
+            # ----------------------------------------------------------------
+            # 2. Validation Loader 테스트 (Split 및 전체 데이터 로드 확인)
+            # ----------------------------------------------------------------
+            val_loader = get_incremental_loader(
+                session_id=sid, 
+                data_root=DATA_ROOT, 
+                mode='val', 
+                batch_size=BATCH_SIZE
+            )
+            
+            val_size = len(val_loader.dataset)
+            print(f"\n  [Val] Loader created (Split Check).")
+            print(f"    -> Dataset size: {val_size} images")
+            
+            # Val 데이터셋은 Few-shot이 적용되지 않으므로 Train보다 훨씬 커야 함
+            if val_size > train_size:
+                print(f"    -> [PASS] Validation set is larger than Few-shot Train set.")
+            else:
+                print(f"    -> [WARNING] Validation set is unusually small. Check split logic.")
+                
+            print(f"\n  [SUCCESS] Session {sid} ({name}) is ready for training!\n")
+
+        except FileNotFoundError as e:
+            print(f"\n  [FAIL] File missing in Session {sid}: {e}")
+            print("  Please check your folder structure and file names.")
+        except Exception as e:
+            print(f"\n  [FAIL] Error in Session {sid}: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        print("\n")
