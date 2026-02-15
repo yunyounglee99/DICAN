@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pt
+*.pth
+*.tar
+*.zip
+dataset/
+logs/
+checkpoints/
+results/
+wandb/

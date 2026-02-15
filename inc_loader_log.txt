@@ -1,0 +1,71 @@
+[*] Testing Incremental Loader with DATA_ROOT: /root/DICAN_DATASETS
+
+============================================================
+Start Checking Session 1: APTOS 2019
+============================================================
+[TRAIN] Session 1: Few-shot applied -> 25 samples.
+  [Train] Loader created.
+    -> Dataset size: 25 images
+    -> Expected size: <= 25 (5 classes * 5 shot)
+    -> Batch Fetch Success!
+    -> Image Shape: torch.Size([4, 3, 224, 224]) (Batch, C, H, W)
+    -> Label Shape: torch.Size([4])
+    -> Sample Labels: [0, 4, 3, 0]
+    -> [PASS] Few-shot sampling seems correct.
+
+  [Val] Loader created (Split Check).
+    -> Dataset size: 366 images
+    -> [PASS] Validation set is larger than Few-shot Train set.
+
+  [SUCCESS] Session 1 (APTOS 2019) is ready for training!
+
+
+
+============================================================
+Start Checking Session 2: Messidor-2
+============================================================
+  [Messidor-2] Dropped 4 rows with missing labels.
+[TRAIN] Session 2: Few-shot applied -> 25 samples.
+  [Train] Loader created.
+    -> Dataset size: 25 images
+    -> Expected size: <= 25 (5 classes * 5 shot)
+    -> Batch Fetch Success!
+    -> Image Shape: torch.Size([4, 3, 224, 224]) (Batch, C, H, W)
+    -> Label Shape: torch.Size([4])
+    -> Sample Labels: [3, 0, 2, 0]
+    -> [PASS] Few-shot sampling seems correct.
+  [Messidor-2] Dropped 4 rows with missing labels.
+
+  [Val] Loader created (Split Check).
+    -> Dataset size: 174 images
+    -> [PASS] Validation set is larger than Few-shot Train set.
+
+  [SUCCESS] Session 2 (Messidor-2) is ready for training!
+
+
+
+============================================================
+Start Checking Session 3: DRAC22
+============================================================
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 225 labels remapped to Global Standard (0, 2, 4).
+[TRAIN] Session 3: Few-shot applied -> 15 samples.
+  [Train] Loader created.
+    -> Dataset size: 15 images
+    -> Expected size: <= 25 (5 classes * 5 shot)
+    -> Batch Fetch Success!
+    -> Image Shape: torch.Size([4, 3, 224, 224]) (Batch, C, H, W)
+    -> Label Shape: torch.Size([4])
+    -> Sample Labels: [0, 4, 2, 0]
+    -> [PASS] Few-shot sampling seems correct.
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 28 labels remapped to Global Standard (0, 2, 4).
+
+  [Val] Loader created (Split Check).
+    -> Dataset size: 61 images
+    -> [PASS] Validation set is larger than Few-shot Train set.
+
+  [SUCCESS] Session 3 (DRAC22) is ready for training!
+
+
+

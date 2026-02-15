@@ -1,0 +1,23 @@
+[*] Testing DDRBaseDataset with root: /root/DICAN_DATASETS/DDR
+
+============================================================
+[Test 1] Loading Train Split...
+[*] Loading DDR (train) from local disk: /root/DICAN_DATASETS/DDR
+    -> 6835 samples loaded.
+  -> Train Size: 6835
+  -> Sample[0] Image Shape: torch.Size([3, 224, 224]) (3, 224, 224 expected)
+  -> Sample[0] Mask Shape : torch.Size([4, 224, 224]) (4, 224, 224 expected)
+  -> Sample[0] Label      : 0 (0~4)
+  -> Mask Unique Values   : tensor([0.]) (should be 0. and 1.)
+
+============================================================
+[Test 2] Loading Valid Split (Check Folder Mapping)...
+[*] Loading DDR (valid) from local disk: /root/DICAN_DATASETS/DDR
+    -> 2733 samples loaded.
+  -> Valid Size: 2733
+  -> Sample[1366] Image Shape: torch.Size([3, 224, 224])
+  -> Sample[1366] Mask Shape : torch.Size([4, 224, 224])
+  -> [Note] This sample has no lesions (Normal or mask missing).
+
+============================================================
+Done.
