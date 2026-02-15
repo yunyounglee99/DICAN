@@ -125,46 +125,53 @@ class UnifiedIncrementalDataset(Dataset):
         self.data_list = self._split_data(all_data)
 
     def _load_messidor2(self):
-            """
-            [Structure Check]
-            messidor-2/
-              IMAGES/ (압축 해제된 폴더)
-              messidor_data.csv
-            """
-            root = os.path.join(self.data_dir, "messidor-2")
-            img_dir = os.path.join(root, "IMAGES") 
-            csv_path = os.path.join(root, "messidor_data.csv")
-            
-            if not os.path.exists(csv_path):
-                raise FileNotFoundError(f"Messidor-2 CSV not found: {csv_path}")
+        root = os.path.join(self.data_dir, "messidor-2")
+        img_dir = os.path.join(root, "IMAGES")
+        csv_path = os.path.join(root, "messidor_data.csv")
 
-            df = pd.read_csv(csv_path)
-            
-            # [수정 1] 라벨(adjudicated_dr_grade)이 비어있는 행(NaN) 제거
-            # 빈 값은 학습에 쓸 수 없으므로 무시합니다.
-            original_len = len(df)
-            df = df.dropna(subset=['adjudicated_dr_grade'])
-            if len(df) < original_len:
+        if not os.path.exists(csv_path):
+            # 혹시 CSV 이름이 다를 수 있으니 예비책
+            csv_path = os.path.join(root, "messidor_2.csv") 
+
+        df = pd.read_csv(csv_path)
+        
+        # 라벨 없는 행 제거
+        original_len = len(df)
+        df = df.dropna(subset=['adjudicated_dr_grade'])
+        if len(df) < original_len:
                 print(f"  [Messidor-2] Dropped {original_len - len(df)} rows with missing labels.")
 
-            all_data = []
+        all_data = []
+        for _, row in df.iterrows():
+            raw_id = str(row['image_id'])
             
-            for _, row in df.iterrows():
-                img_id = row['image_id']
-                # Messidor 이미지는 보통 .jpg 형식이지만 CSV엔 확장자가 없는 경우가 많음
-                fname = str(img_id)
-                if not fname.lower().endswith(('.jpg', '.png', '.jpeg')):
-                    fname += ".jpg" 
-                
-                full_path = os.path.join(img_dir, fname)
-                
+            # [핵심 수정] 확장자가 붙어있으면 일단 떼어냄 (중복 방지)
+            if raw_id.lower().endswith('.jpg'):
+                base_id = raw_id[:-4]
+            else:
+                base_id = raw_id
+            
+            # 후보군 생성: 소문자, 대문자, 원본
+            candidates = [base_id + ".jpg", base_id + ".JPG", raw_id]
+            
+            found_path = None
+            for cand in candidates:
+                full_path = os.path.join(img_dir, cand)
+                if os.path.exists(full_path):
+                    found_path = full_path
+                    break
+            
+            if found_path:
                 all_data.append({
-                    "path": full_path,
-                    # [수정 2] float -> int 안전하게 변환
+                    "path": found_path,
                     "label": int(float(row['adjudicated_dr_grade']))
                 })
-                
-            self.data_list = self._split_data(all_data)
+            else:
+                # 못 찾았을 때만 조용히 로그 (너무 많이 뜨면 주석 처리)
+                # print(f"[Warning] Image not found: {base_id}")
+                pass
+
+        self.data_list = self._split_data(all_data)
 
     def _load_drac22(self):
         """
@@ -254,7 +261,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # [사용자 설정] 실제 데이터셋이 있는 루트 폴더 경로로 수정해주세요.
     # 예: '/Users/nyoung/DICAN_DATASETS'
-    DATA_ROOT = '/Volumes/Nyoungs_SSD/macbook/dev/datasets/DICAN_DATASETS' 
+    DATA_ROOT = '/root/DICAN_DATASETS' 
     # -------------------------------------------------------------------------
 
     print(f"[*] Testing Incremental Loader with DATA_ROOT: {DATA_ROOT}\n")
