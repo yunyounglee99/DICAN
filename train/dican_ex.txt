@@ -1,0 +1,72 @@
+
+==================================================
+🚀 DICAN Training Start
+   - Data Root: /root/DICAN_DATASETS/DDR
+   - Device: cuda
+   - Concepts: 4
+==================================================
+
+[*] Loading Base Data (DDR) from /root/DICAN_DATASETS/DDR...
+[*] Loading DDR (train) from local disk: /root/DICAN_DATASETS/DDR
+    -> 6260 samples loaded.
+    -> [Note] Discarded 575 samples with label 5 (Ungradable).
+[*] Loading DDR (valid) from local disk: /root/DICAN_DATASETS/DDR
+    -> 2503 samples loaded.
+    -> [Note] Discarded 230 samples with label 5 (Ungradable).
+[*] Switching DICAN session mode to: BASE
+   -> Backbone: Trainable (Fine-tuning)
+   -> Projector: Frozen (Identity)
+   -> Prototypes: Updating with Masks
+   -> Head: Trainable
+
+[========== Data Statistics (Base Session) ==========]
+  - Total Train Samples: 6260
+  - Total Valid Samples: 2503
+  - [Batch] Image Shape : torch.Size([32, 3, 224, 224])
+  - [Batch] Label Shape : torch.Size([32])
+  - [Batch] Mask Shape  : torch.Size([32, 4, 224, 224])
+=============================================
+
+
+==================== [Phase 1] Base Training Start (Projector OFF) ====================
+
+[========== Data Statistics (Base Session) ==========]
+  - Total Train Samples: 6260
+  - Total Valid Samples: 2503
+  - [Batch] Image Shape : torch.Size([32, 3, 224, 224])
+  - [Batch] Label Shape : torch.Size([32])
+  - [Batch] Mask Shape  : torch.Size([32, 4, 224, 224])
+=============================================
+
+Base Train Epoch 1/30:   0%|          | 0/196 [00:00<?, ?it/s]Base Train Epoch 1/30:   0%|          | 0/196 [00:02<?, ?it/s]
+Traceback (most recent call last):
+  File "/root/DICAN/train/train.py", line 263, in <module>
+    main()
+    ~~~~^^
+  File "/root/DICAN/train/train.py", line 206, in main
+    model = base_trainer.run()
+  File "/root/DICAN/train/train_base.py", line 213, in run
+    self.train_epoch(epoch)
+    ~~~~~~~~~~~~~~~~^^^^^^^
+  File "/root/DICAN/train/train_base.py", line 102, in train_epoch
+    for batch_idx, batch_data in enumerate(loop):
+                                 ~~~~~~~~~^^^^^^
+  File "/venv/dican/lib/python3.14/site-packages/tqdm/std.py", line 1181, in __iter__
+    for obj in iterable:
+               ^^^^^^^^
+  File "/venv/dican/lib/python3.14/site-packages/torch/utils/data/dataloader.py", line 741, in __next__
+    data = self._next_data()
+  File "/venv/dican/lib/python3.14/site-packages/torch/utils/data/dataloader.py", line 1524, in _next_data
+    idx, data = self._get_data()
+                ~~~~~~~~~~~~~~^^
+  File "/venv/dican/lib/python3.14/site-packages/torch/utils/data/dataloader.py", line 1473, in _get_data
+    success, data = self._try_get_data()
+                    ~~~~~~~~~~~~~~~~~~^^
+  File "/venv/dican/lib/python3.14/site-packages/torch/utils/data/dataloader.py", line 1310, in _try_get_data
+    data = self._data_queue.get(timeout=timeout)
+  File "/venv/dican/lib/python3.14/queue.py", line 210, in get
+    self.not_empty.wait(remaining)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "/venv/dican/lib/python3.14/threading.py", line 373, in wait
+    gotit = waiter.acquire(True, timeout)
+KeyboardInterrupt

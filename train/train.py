@@ -2,13 +2,13 @@
 Using Example :
 
 python train.py \
-  --data_path /Volumes/Nyoungs_SSD/macbook/dev/datasets/DICAN_DATASETS/DDR \
+  --data_path /root/DICAN_DATASETS/DDR \
   --dataset DDR \
-  --epochs_base 20 \
+  --epochs_base 30 \
   --batch_size 32 \
   --n_tasks 4 \
   --n_shot 10 \
-  --device cuda
+  --device cuda > dican_ex.txt 2>&1
 
 """
 
@@ -29,6 +29,7 @@ from data.inc_loader import get_incremental_loader
 from models.dican_cbm import DICAN_CBM
 from train_base import BaseTrainer
 from train_incremental import IncrementalTrainer
+from utils.metrics import Evaluator
 
 # -----------------------------------------------------------------------------
 # 2. 유틸리티 함수
@@ -63,8 +64,8 @@ def get_args():
     # [Base Training]
     parser.add_argument('--epochs_base', type=int, default=20, help='Base training epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='Base batch size')
-    parser.add_argument('--lr_base', type=float, default=1e-4, help='Base learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--lr_base', type=float, default=1e-2, help='Base learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-3, help='Weight decay')
     parser.add_argument('--lambda_c', type=float, default=1.0, help='Concept loss weight')
     
     # [Incremental Training]
@@ -92,10 +93,23 @@ class IncLoaderManager:
             3: 3  # DRAC22
         }
 
-    def get_incremental_loaders(self, task_id):
+    def get_incremental_loaders(self, task_id, mode_override=None):
         session_id = self.task_to_session.get(task_id)
         if session_id is None:
-            raise ValueError(f"[Error] No session mapped for Task ID {task_id}")
+            # Task ID 0은 Base Loader이므로 None 리턴 혹은 에러 처리
+            return None, None
+
+        if mode_override == 'test':
+            # Test Loader만 필요할 때
+            print(f"[*] (Eval) Loading Test Data for Task {task_id}...")
+            query_loader = get_incremental_loader(
+                session_id=session_id,
+                data_root=self.args.data_path,
+                mode='test',
+                batch_size=self.args.batch_size,
+                shot=None
+            )
+            return None, query_loader
 
         print(f"[*] Loading Incremental Data for Task {task_id} (Session {session_id})...")
         
@@ -104,7 +118,7 @@ class IncLoaderManager:
             session_id=session_id,
             data_root=self.args.data_path,
             mode='train',
-            batch_size=self.args.batch_size, # 메모리가 적다면 줄여야 함
+            batch_size=self.args.batch_size,
             shot=self.args.n_shot
         )
         
@@ -112,7 +126,7 @@ class IncLoaderManager:
         query_loader = get_incremental_loader(
             session_id=session_id,
             data_root=self.args.data_path,
-            mode='test', # 공정한 평가를 위해 test 셋 사용
+            mode='test',
             batch_size=self.args.batch_size,
             shot=None
         )
@@ -172,20 +186,31 @@ def main():
     # -------------------------------------------------------
     # [Phase 1] Base Training (Task 0)
     # -------------------------------------------------------
+    
+    # Loader Manager 초기화 (Eval 용)
+    inc_loader_manager = IncLoaderManager(args)
+    
     # 1-1. Base Loader 준비
     train_loader, val_loader = get_base_loaders(args)
     
-    # 1-2. Mode 설정 (Backbone/Head 학습, Projector Freeze)
+    # [NEW] Evaluator 초기화
+    # Base Val Loader는 Task 0 평가용으로 전달
+    evaluator = Evaluator(model, device, val_loader, inc_loader_manager, args)
+
     model.set_session_mode('base')
-    
-    # 1-3. Trainer 실행
     base_trainer = BaseTrainer(args, model, device, train_loader, val_loader)
     
-    # [추가 요청] 데이터 통계 확인
     if hasattr(base_trainer, 'check_data_statistics'):
         base_trainer.check_data_statistics()
         
-    model = base_trainer.run() # 학습 및 Prototype 초기화 완료
+    model = base_trainer.run() 
+    
+    # [EVAL] Base Session 종료 후 평가 (Task 0 완료 시점)
+    # 이때 Future Task (Task 1, 2, 3...)에 대해서도 평가를 수행해야 FWT를 잴 수 있음
+    print("\n[Eval] Evaluation after Base Session (Task 0)...")
+    evaluator.evaluate_all_tasks(current_session_id=0)
+    metrics = evaluator.calculate_metrics(current_session_id=0)
+    print(f"   >>> Base Avg Acc: {metrics['avg_acc']:.2f}%")
 
     # -------------------------------------------------------
     # [Phase 2] Incremental Learning (Task 1 ~ N)
@@ -203,20 +228,35 @@ def main():
     # 2-3. Trainer 초기화 (PrototypeBank 연동)
     inc_trainer = IncrementalTrainer(args, model, device, inc_loader_manager)
     
-    acc_history = []
-    
-    # Task Loop
     for task_id in range(1, args.n_tasks):
-        # train_task 내부에서 check_data_statistics 호출됨 (수정된 코드 기준)
+        # 1. 학습
         acc = inc_trainer.train_task(task_id)
-        acc_history.append(acc)
         
-        print(f"📈 [Result] Task {task_id} Accuracy: {acc:.2f}%")
-        print(f"    Current Avg Acc: {sum(acc_history)/len(acc_history):.2f}%")
+        # 2. [EVAL] 전체 태스크 평가 및 Metric 계산
+        # 현재 Task 학습이 끝났으므로, 과거~현재~미래 모든 태스크 성능 측정
+        print(f"\n[Eval] Evaluation after Task {task_id}...")
+        evaluator.evaluate_all_tasks(current_session_id=task_id)
+        
+        # 3. Metric 계산
+        metrics = evaluator.calculate_metrics(current_session_id=task_id)
+        
+        print(f"\n📊 [Metrics - Task {task_id}]")
+        print(f"   - Average Accuracy  : {metrics['avg_acc']:.2f}%")
+        print(f"   - Backward Transfer : {metrics['bwt']:.2f}%  (High is good)")
+        print(f"   - Forward Transfer  : {metrics['fwt']:.2f}%  (High is good)")
+        print(f"   - Forgetting        : {metrics['forgetting']:.2f}% (Low is good)")
+        print(f"   - Task Accuracies   : {metrics['raw_accs']}")
+        print("-" * 30)
 
     print("\n" + "="*50)
     print("🎉 All Training Finished!")
-    print(f"   - Final Average Accuracy: {sum(acc_history)/len(acc_history):.2f}%")
+    
+    # 최종 결과 재출력
+    final_metrics = evaluator.calculate_metrics(current_session_id=args.n_tasks-1)
+    print(f"   - Final Average Accuracy : {final_metrics['avg_acc']:.2f}%")
+    print(f"   - Final BWT              : {final_metrics['bwt']:.2f}%")
+    print(f"   - Final FWT              : {final_metrics['fwt']:.2f}%")
+    print(f"   - Final Forgetting       : {final_metrics['forgetting']:.2f}%")
     print("="*50)
 
 if __name__ == "__main__":
