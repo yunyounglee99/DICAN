@@ -53,6 +53,8 @@ class DICANLoss(nn.Module):
         labels = targets['label']
         logits = outputs['logits']
         masks = targets['masks']
+
+        class_weights = torch.tensor([0.5, 2.0, 2.0, 3.0, 3.0], device=logits.device)
         
         # A. Classification Loss (Head 학습용)
         loss_cls = F.cross_entropy(logits, labels)

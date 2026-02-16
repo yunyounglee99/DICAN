@@ -66,10 +66,11 @@ class DICAN_CBM(nn.Module):
             if masks is None:
                 raise ValueError("[Base Session] Segmentation masks are required for training!")
             
+            do_update = self.training
             # Projector는 사용하지 않음 (Pass-through)
             # 마스크를 사용하여 '진짜 병변' 특징만 추출하고 Prototype 업데이트
             # 리턴값: 현재 배치의 Concept Score (Head 학습용)
-            concept_scores = self.prototypes.update_with_masks(raw_features, masks)
+            concept_scores = self.prototypes.update_with_masks(raw_features, masks, do_update)
             
             # Base Session에서는 Projector 출력이 의미가 없으므로 raw_features를 그대로 둠
             aligned_features = raw_features 
