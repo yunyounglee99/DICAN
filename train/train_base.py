@@ -24,23 +24,20 @@ class BaseTrainer:
         self.val_loader = val_loader
 
         # --------------------------------------------------------
-        # [핵심 수정 1] Projector Freeze (Base 단계에서는 Identity 취급)
+        # 1. Projector Freeze (Base 단계에서는 Identity 취급)
         # --------------------------------------------------------
-        # Backbone과 Head는 학습 모드
         self.model.backbone.train()
         if hasattr(self.model, 'head'):
             self.model.head.train()
             
-        # Projector는 평가 모드 & Gradient 계산 끄기
         if hasattr(self.model, 'projector'):
             self.model.projector.eval() 
             for param in self.model.projector.parameters():
                 param.requires_grad = False
         
         # --------------------------------------------------------
-        # [핵심 수정 2] Optimizer에 Projector 파라미터 제외
+        # 2. Optimizer (Projector 파라미터 제외)
         # --------------------------------------------------------
-        # requires_grad가 True인 파라미터(Backbone, Head)만 필터링하여 전달
         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
         
         self.optimizer = optim.AdamW(
@@ -53,13 +50,46 @@ class BaseTrainer:
             self.optimizer, T_max=self.args.epochs_base
         )
 
-        # Loss Function & Prototype Bank
-        self.criterion = DICANLoss(args) 
-        self.proto_bank = PrototypeBank(args, device)
+        # --------------------------------------------------------
+        # 3. Loss & Prototype Bank
+        # --------------------------------------------------------
+        self.criterion = DICANLoss(
+            mode='base',
+            num_concepts=self.args.n_concepts, 
+            num_classes=self.args.num_classes
+        ).to(self.device)
+        
+        self.proto_bank = PrototypeBank(
+            num_concepts=self.args.n_concepts, 
+            feature_dim=2048 # ResNet50 기준
+        ).to(self.device)
+
+    def check_data_statistics(self):
+        """학습 시작 전 데이터셋 크기 및 Shape 확인"""
+        print(f"\n[{'='*10} Data Statistics (Base Session) {'='*10}]")
+        train_len = len(self.train_loader.dataset)
+        val_len = len(self.val_loader.dataset)
+        print(f"  - Total Train Samples: {train_len}")
+        print(f"  - Total Valid Samples: {val_len}")
+
+        try:
+            batch = next(iter(self.train_loader))
+            # [수정] 딕셔너리 접근 방식 사용
+            if isinstance(batch, dict):
+                images = batch['image']
+                labels = batch['label']
+                print(f"  - [Batch] Image Shape : {images.shape}")
+                print(f"  - [Batch] Label Shape : {labels.shape}")
+                if 'masks' in batch:
+                    print(f"  - [Batch] Mask Shape  : {batch['masks'].shape}")
+            else:
+                print(f"  - [Batch] Data is not a dictionary: {type(batch)}")
+        except Exception as e:
+            print(f"  - [Warning] Failed to fetch batch for stats: {e}")
+        print("="*45 + "\n")
 
     def train_epoch(self, epoch):
         self.model.train()
-        # Projector는 확실히 eval 모드로 고정 (혹시 model.train() 호출로 풀릴까봐 안전장치)
         if hasattr(self.model, 'projector'):
             self.model.projector.eval()
             
@@ -70,31 +100,31 @@ class BaseTrainer:
         loop = tqdm(self.train_loader, desc=f"Base Train Epoch {epoch+1}/{self.args.epochs_base}")
         
         for batch_idx, batch_data in enumerate(loop):
-            if len(batch_data) == 3:
-                images, labels, concept_masks = batch_data
-                concept_masks = concept_masks.to(self.device).float()
+            # [핵심 수정] 리스트 언패킹 -> 딕셔너리 키 접근
+            images = batch_data['image'].to(self.device)
+            labels = batch_data['label'].to(self.device)
+            
+            # 마스크가 있는 경우만 로드 (Base Loader는 항상 있음)
+            if 'masks' in batch_data:
+                concept_masks = batch_data['masks'].to(self.device).float()
             else:
-                images, labels = batch_data
-                concept_masks = None
-
-            images, labels = images.to(self.device), labels.to(self.device)
+                raise ValueError('Segmentation masks are missing in Base Training!')
             
             self.optimizer.zero_grad()
             
-            # --------------------------------------------------------
-            # [핵심 수정 3] Forward 시 Projector 사용 안 함 (Identity)
-            # --------------------------------------------------------
-            # use_projector=False를 전달하여 backbone feature가 바로 concept이 되도록 유도
-            logits, concepts = self.model(images, use_projector=False)
+            # Forward (Projector OFF)
+            model_outputs = self.model(images, masks=concept_masks)
+
+            targets = {'label': labels, 'masks': concept_masks}
             
-            loss_dict = self.criterion(logits, labels, concepts, concept_masks)
-            loss = loss_dict['total']
+            # Loss 계산
+            loss, log_dict = self.criterion(model_outputs, targets)
             
             loss.backward()
             self.optimizer.step()
             
-            # Metrics
             total_loss += loss.item()
+            logits = model_outputs['logits']
             _, predicted = logits.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
@@ -112,20 +142,23 @@ class BaseTrainer:
         
         with torch.no_grad():
             for batch_data in self.val_loader:
-                if len(batch_data) == 3:
-                    images, labels, concept_masks = batch_data
-                    concept_masks = concept_masks.to(self.device).float()
+                # [핵심 수정] 딕셔너리 접근
+                images = batch_data['image'].to(self.device)
+                labels = batch_data['label'].to(self.device)
+                
+                if 'masks' in batch_data:
+                    concept_masks = batch_data['masks'].to(self.device).float()
                 else:
-                    images, labels = batch_data
-                    concept_masks = None
+                    concept_masks = torch.zeros(images.size(0), self.args.n_concepts, 224, 224).to(self.device)
 
-                images, labels = images.to(self.device), labels.to(self.device)
-                
                 # Validation에서도 Projector 없이 평가
-                logits, concepts = self.model(images, use_projector=False)
+                model_outputs = self.model(images, masks = concept_masks)
+                targets = {'label': labels, 'masks': concept_masks}
                 
-                loss_dict = self.criterion(logits, labels, concepts, concept_masks)
-                val_loss += loss_dict['total'].item()
+                loss, log_dict = self.criterion(model_outputs, targets)
+                val_loss += loss.item()
+
+                logits = model_outputs['logits']
                 
                 _, predicted = logits.max(1)
                 total += labels.size(0)
@@ -139,7 +172,7 @@ class BaseTrainer:
     def extract_and_save_prototypes(self):
         """
         Base 학습 완료 후, Prototype 추출
-        이때도 use_projector=False로 추출해야 Backbone의 순수 Feature가 저장됨
+        (use_projector=False로 추출해야 Backbone의 순수 Feature가 저장됨)
         """
         print("\n[*] Extracting Base Prototypes (Backbone Features)...")
         self.model.eval()
@@ -149,33 +182,33 @@ class BaseTrainer:
         
         with torch.no_grad():
             for batch_data in tqdm(self.train_loader, desc="Extracting Features"):
-                if len(batch_data) == 3:
-                    images, labels, _ = batch_data
+                # [핵심 수정] 딕셔너리 접근
+                images = batch_data['image'].to(self.device)
+                labels = batch_data['label'].to(self.device)
+                
+                # Base Session에서는 Mask를 활용해 Prototype 업데이트
+                if 'masks' in batch_data:
+                    masks = batch_data['masks'].to(self.device).float()
                 else:
-                    images, labels = batch_data
+                    continue # 마스크 없으면 스킵
                 
-                images = images.to(self.device)
+                # Projector 없이 Feature 추출
+                _, features = self.model(images, use_projector=False)
                 
-                # Projector 없이(Identity) Feature 추출
-                _, concepts = self.model(images, use_projector=False)
-                
-                all_concepts.append(concepts.cpu())
-                all_labels.append(labels.cpu())
+                # 배치 단위로 프로토타입 업데이트 (PrototypeBank 내부에서 처리)
+                self.proto_bank.update_with_masks(features, masks)
         
-        features = torch.cat(all_concepts, dim=0)
-        labels = torch.cat(all_labels, dim=0)
-        
-        self.proto_bank.update(features, labels, task_id=0)
-        
+        # 모델에 프로토타입 주입
         if hasattr(self.model, 'prototypes'):
-            self.model.prototypes = self.proto_bank.get_prototypes()
+            self.model.prototypes = self.proto_bank.prototypes.clone()
             
-        print(f"[*] Base Prototypes Saved. Classes: {len(torch.unique(labels))}")
+        print(f"[*] Base Prototypes Updated via Masked Averaging.")
 
     def run(self):
         print(f"\n{'='*20} [Phase 1] Base Training Start (Projector OFF) {'='*20}")
-        best_acc = 0.0
+        self.check_data_statistics()
         
+        best_acc = 0.0
         for epoch in range(self.args.epochs_base):
             self.train_epoch(epoch)
             

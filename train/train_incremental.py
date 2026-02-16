@@ -20,15 +20,48 @@ class IncrementalTrainer:
         self.device = device
         self.inc_loader = inc_loader
         
-        # Prototype Bank 초기화
-        self.proto_bank = PrototypeBank(args, device)
+        # [Fix] Prototype Bank 초기화 수정 (정확한 인자 전달)
+        self.proto_bank = PrototypeBank(
+            num_concepts=self.args.n_concepts, 
+            feature_dim=2048 # ResNet50 기준
+        ).to(self.device)
         
         # 모델에 기존 프로토타입이 있다면 로드 (연속 학습을 위해)
         if hasattr(self.model, 'prototypes') and self.model.prototypes is not None:
             self.proto_bank.prototypes = self.model.prototypes.clone()
+            if hasattr(self.proto_bank, 'initialized'):
+                self.proto_bank.initialized.fill_(True)
 
         # Loss Function (Adaptation용)
-        self.criterion = DICANLoss(args)
+        self.criterion = DICANLoss(
+            mode='incremental',
+            num_concepts=self.args.n_concepts,
+            num_classes=self.args.num_classes
+        ).to(self.device)
+
+    def check_data_statistics(self, task_id, support_loader, query_loader):
+        """Task별 데이터셋 정보 출력"""
+        print(f"\n[{'='*10} Data Statistics (Task {task_id}) {'='*10}]")
+        print(f"  - Support Set (Train) Size: {len(support_loader.dataset)}")
+        print(f"  - Query Set (Test) Size   : {len(query_loader.dataset)}")
+        
+        try:
+            batch = next(iter(support_loader))
+            # [수정] 딕셔너리 키 접근
+            if isinstance(batch, dict):
+                images = batch['image']
+                labels = batch['label']
+                print(f"  - [Batch] Image Shape : {images.shape}")
+                print(f"  - [Batch] Label Shape : {labels.shape}")
+                if 'masks' in batch:
+                    print(f"  - [Batch] Mask Shape  : {batch['masks'].shape}")
+                else:
+                    print(f"  - [Batch] Mask Shape  : None (Incremental Session)")
+            else:
+                print(f"  - [Batch] Data Type: {type(batch)} (Expected dict)")
+        except Exception as e:
+            print(f"  - [Warning] Failed to inspect batch: {e}")
+        print("="*45 + "\n")
 
     def train_task(self, task_id):
         print(f"\n{'='*20} [Phase 2] Incremental Task {task_id} Start {'='*20}")
@@ -36,8 +69,10 @@ class IncrementalTrainer:
         # 데이터 로드
         support_loader, query_loader = self.inc_loader.get_incremental_loaders(task_id)
         
+        # 데이터 통계 확인
+        self.check_data_statistics(task_id, support_loader, query_loader)
+        
         # 1. Adaptation (Fine-tuning)
-        # [중요] Backbone과 Head는 얼리고 Projector만 학습합니다.
         if self.args.adaptation_steps > 0:
             self.adapt_to_domain(support_loader, task_id)
             
@@ -57,31 +92,31 @@ class IncrementalTrainer:
         """
         print(f"[*] Adapting to Task {task_id} (Projector Only Fine-tuning)...")
         
-        # -----------------------------------------------------------
-        # [핵심 수정] Freeze Logic 적용
-        # -----------------------------------------------------------
-        # 1. Backbone Freeze (평가 모드 + Gradient 계산 끔)
+        # 1. Backbone & Head Freeze
         self.model.backbone.eval()
         for param in self.model.backbone.parameters():
             param.requires_grad = False
             
-        # 2. Head Freeze (평가 모드 + Gradient 계산 끔)
         if hasattr(self.model, 'head') and self.model.head is not None:
             self.model.head.eval()
             for param in self.model.head.parameters():
                 param.requires_grad = False
                 
-        # 3. Projector Unfreeze (학습 모드 + Gradient 계산 켬)
-        self.model.projector.train()
-        for param in self.model.projector.parameters():
-            param.requires_grad = True
+        # 2. Projector Unfreeze
+        if hasattr(self.model, 'projector'):
+            self.model.projector.train()
+            for param in self.model.projector.parameters():
+                param.requires_grad = True
             
-        # 4. Optimizer에는 Projector 파라미터만 전달!
-        optimizer = optim.SGD(
-            self.model.projector.parameters(), # <--- Projector만 전달
-            lr=self.args.lr_inc, 
-            momentum=0.9
-        )
+            # Optimizer 설정 (Projector 파라미터만)
+            optimizer = optim.SGD(
+                self.model.projector.parameters(),
+                lr=self.args.lr_inc, 
+                momentum=0.9
+            )
+        else:
+            print("[Warning] No projector found in model. Skipping adaptation.")
+            return
         
         iterator = iter(support_loader)
         
@@ -92,33 +127,30 @@ class IncrementalTrainer:
                 iterator = iter(support_loader)
                 batch_data = next(iterator)
             
-            # 데이터 로더 반환값 처리 (Mask 유무)
-            if len(batch_data) == 3:
-                images, labels, concept_masks = batch_data
-                concept_masks = concept_masks.to(self.device).float()
+            # [수정] 딕셔너리 데이터 처리
+            images = batch_data['image'].to(self.device)
+            labels = batch_data['label'].to(self.device)
+            
+            if 'masks' in batch_data:
+                concept_masks = batch_data['masks'].to(self.device).float()
             else:
-                images, labels = batch_data
                 concept_masks = None
                 
-            images, labels = images.to(self.device), labels.to(self.device)
-            
             optimizer.zero_grad()
             
             # Forward Pass
-            logits, concepts = self.model(images)
-            
-            # Loss Calculation (Mask 유무에 따라 처리)
-            loss_dict = self.criterion(logits, labels, concepts, concept_masks)
-            loss = loss_dict['total']
+            model_outputs = self.model(images)
+            targets = {'label': labels, 'masks': concept_masks}
+
+            loss, log_dict = self.criterion(model_outputs, targets)
             
             loss.backward()
             optimizer.step()
             
-            # 학습 상황 로깅 (옵션)
             if (step + 1) % 10 == 0:
                 print(f"    Step [{step+1}/{self.args.adaptation_steps}] Loss: {loss.item():.4f}")
 
-        # 학습 종료 후 모델 전체를 다시 Eval 모드로 전환 (안전장치)
+        # 학습 종료 후 다시 Eval 모드
         self.model.eval()
 
     def register_prototypes(self, support_loader, task_id):
@@ -131,13 +163,10 @@ class IncrementalTrainer:
         
         with torch.no_grad():
             for batch_data in support_loader:
-                if len(batch_data) == 3:
-                    images, labels, _ = batch_data
-                else:
-                    images, labels = batch_data
+                # [수정] 딕셔너리 데이터 처리
+                images = batch_data['image'].to(self.device)
+                labels = batch_data['label'].to(self.device)
                     
-                images = images.to(self.device)
-                
                 # Concept Feature 추출
                 _, concepts = self.model(images)
                 
@@ -162,14 +191,10 @@ class IncrementalTrainer:
         
         with torch.no_grad():
             for batch_data in tqdm(query_loader, desc=f"Evaluating Task {task_id}"):
-                if len(batch_data) == 3:
-                    images, labels, _ = batch_data
-                else:
-                    images, labels = batch_data
+                # [수정] 딕셔너리 데이터 처리
+                images = batch_data['image'].to(self.device)
+                labels = batch_data['label'].to(self.device)
 
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-                
                 # Forward Pass (logits는 프로토타입과의 거리 기반 점수)
                 logits, _ = self.model(images)
                 

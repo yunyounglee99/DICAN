@@ -44,7 +44,7 @@ class DICAN_CBM(nn.Module):
         Args:
             x (Tensor): Input Image [Batch, 3, 224, 224]
             masks (Tensor, optional): Segmentation Masks [Batch, 4, 224, 224]
-                                      (Base Session에서만 필수)
+                                    (Base Session에서만 필수)
         Returns:
             output (dict): Loss 계산을 위한 모든 중간/최종 결과값 포함
                 - 'logits': 최종 DR 등급 예측값 (Ordinal Regression용)
