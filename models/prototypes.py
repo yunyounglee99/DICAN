@@ -52,6 +52,24 @@ class PrototypeBank(nn.Module):
         similarity = torch.mm(z_norm, p_norm.t())
         
         return similarity
+    
+    def compute_spatial_similarity(self, features):
+        """
+        [Fix] Base Session의 Segmentation Loss를 위한 공간 유사도 맵 계산
+        Args:
+            features: [Batch, 2048, 7, 7]
+        Returns:
+            spatial_sim: [Batch, num_concepts, 7, 7]
+        """
+        # Feature 정규화 (Channel 차원 기준)
+        f_norm = F.normalize(features, p=2, dim=1) # [B, 2048, 7, 7]
+        # Prototype 정규화
+        p_norm = F.normalize(self.prototypes, p=2, dim=1) # [K, 2048]
+        
+        # 1x1 Convolution 처럼 연산: (B, C, H, W) * (K, C) -> (B, K, H, W)
+        # einsum 사용: bchw, kc -> bkhw
+        spatial_sim = torch.einsum('bchw,kc->bkhw', f_norm, p_norm)
+        return spatial_sim
 
     def update_with_masks(self, features, masks):
         """
@@ -95,13 +113,12 @@ class PrototypeBank(nn.Module):
             # 현재 배치에서 병변이 실제로 존재하는 샘플만 골라서 업데이트
             valid_indices = (mask_k.view(batch_size, -1).sum(dim=1) > 0) # [B]
             if valid_indices.any():
-                valid_feats = masked_feat[valid_indices] # [valid_B, 2048]
+                valid_feats = masked_feat[valid_indices].detach() # [valid_B, 2048]
                 new_proto = valid_feats.mean(dim=0) # [2048]
                 
                 # 이동 평균 업데이트
                 if self.initialized[0]:
-                    self.prototypes[k] = self.momentum * self.prototypes[k] + \
-                                         (1 - self.momentum) * new_proto
+                    self.prototypes[k] = self.momentum * self.prototypes[k] + (1 - self.momentum) * new_proto
                 else:
                     self.prototypes[k] = new_proto
 

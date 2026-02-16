@@ -52,6 +52,7 @@ class DICANLoss(nn.Module):
     def _forward_base(self, outputs, targets):
         labels = targets['label']
         logits = outputs['logits']
+        masks = targets['masks']
         
         # A. Classification Loss (Head 학습용)
         loss_cls = F.cross_entropy(logits, labels)
@@ -69,19 +70,20 @@ class DICANLoss(nn.Module):
         # 만약 모델 내부에 Auxiliary Seg Head가 있다면 그 출력을 사용함.
         # (README 설계상 L_seg는 Backbone 학습용이라고 명시됨)
         
-        # *구현*: Feature Map의 L2 Norm(활성도)이 마스크 영역에서 높아야 함.
-        features = outputs['features'] # [B, 2048, 7, 7]
-        masks = targets['masks']       # [B, 4, 224, 224]
-        
-        # Feature Map을 공간적으로 평균내어 Activation Map 생성 [B, 1, 7, 7]
-        activation_map = torch.mean(features.abs(), dim=1, keepdim=True)
-        # 마스크를 7x7로 줄이고 합침 (병변이 있는 곳은 1, 없는 곳은 0)
-        mask_guidance = F.interpolate(masks, size=(7,7), mode='nearest').max(dim=1, keepdim=True)[0]
-        
-        # 마스크가 있는 곳의 Activation은 키우고, 없는 곳은 줄임
-        # (Binary Cross Entropy와 유사한 효과)
-        activation_norm = torch.sigmoid(activation_map) # 0~1로 변환
-        loss_seg = F.binary_cross_entropy(activation_norm, mask_guidance)
+        if outputs['spatial_sim_map'] is not None:
+            spatial_sim = outputs['spatial_sim_map'] # [B, 4, 7, 7] (값 범위: -1 ~ 1)
+            
+            # 마스크 리사이징 (Nearest)
+            masks_resized = F.interpolate(masks, size=spatial_sim.shape[2:], mode='nearest') # [B, 4, 7, 7]
+            
+            # Cosine Similarity(-1~1)를 확률(0~1)로 변환
+            # (sim + 1) / 2
+            spatial_probs = (spatial_sim + 1) * 0.5
+            
+            # Pixel-wise BCE Loss 계산
+            loss_seg = F.binary_cross_entropy(spatial_probs, masks_resized)
+        else:
+            loss_seg = torch.tensor(0.0, device=logits.device)
 
         total_loss = loss_cls + self.lambda_seg * loss_seg
         return total_loss, {"loss_cls": loss_cls.item(), "loss_seg": loss_seg.item()}

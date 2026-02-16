@@ -57,6 +57,7 @@ class DICAN_CBM(nn.Module):
         
         concept_scores = None
         aligned_features = None
+        spatial_sim_map = None
 
         # -----------------------------------------------------------
         # CASE 1: Base Session (Masked GAP -> Prototype Update)
@@ -72,6 +73,7 @@ class DICAN_CBM(nn.Module):
             
             # Base Session에서는 Projector 출력이 의미가 없으므로 raw_features를 그대로 둠
             aligned_features = raw_features 
+            spatial_sim_map = self.prototypes.compute_spatial_similarity(raw_features)
 
         # -----------------------------------------------------------
         # CASE 2: Incremental Session (Projector -> Similarity)
@@ -95,7 +97,8 @@ class DICAN_CBM(nn.Module):
         return {
             "logits": logits,
             "concept_scores": concept_scores,
-            "features": aligned_features # Alignment Loss 계산을 위해 필요
+            "features": aligned_features, # Alignment Loss 계산을 위해 필요
+            "spatial_sim_map": spatial_sim_map
         }
 
     def set_session_mode(self, mode):
