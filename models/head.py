@@ -16,7 +16,7 @@ class OrdinalRegressionHead(nn.Module):
     - Base Session 이후에는 이 논리가 변하면 안 되므로 파라미터를 Freeze함.
     """
 
-    def __init__(self, num_concepts=4, num_classes=5, hidden_dims=[32, 16], dropout=0.0):
+    def __init__(self, num_concepts=4, num_classes=5, num_sub_concepts=5, hidden_dims=[32, 16], dropout=0.0):
         """
         Args:
             num_concepts (int): 입력 차원 (Concept 개수, DDR=4)
@@ -30,7 +30,7 @@ class OrdinalRegressionHead(nn.Module):
         
         # 1. MLP 레이어 구축
         layers = []
-        in_dim = num_concepts
+        in_dim = num_concepts * num_sub_concepts
         
         for h_dim in hidden_dims:
             layers.append(nn.Linear(in_dim, h_dim))

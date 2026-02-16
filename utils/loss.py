@@ -52,37 +52,39 @@ class DICANLoss(nn.Module):
     def _forward_base(self, outputs, targets):
         labels = targets['label']
         logits = outputs['logits']
-        masks = targets['masks']
-
+        masks = targets['masks'] # [B, 4, 224, 224]
+        
+        # A. Classification Loss (Class Weight 적용)
         class_weights = torch.tensor([0.5, 2.0, 2.0, 3.0, 3.0], device=logits.device)
+        loss_cls = F.cross_entropy(logits, labels, weight=class_weights)
         
-        # A. Classification Loss (Head 학습용)
-        loss_cls = F.cross_entropy(logits, labels)
-        
-        # B. Segmentation Loss (Backbone 학습용)
-        # Backbone의 Feature Map과 GT Mask 간의 차이 계산
-        # features: [B, 2048, 7, 7] -> Channel-wise mean or 1x1 conv to [B, 4, 7, 7]
-        # *주의: Backbone 출력은 2048채널이므로, 마스크(4채널)와 비교하려면
-        # 보통 별도의 SegHead가 있거나, 여기서는 간단히 Backbone 학습 유도를 위해
-        # 'Attention Map'과 마스크를 비교하는 방식을 사용.
-        # (DICAN 논리상 Masked GAP를 쓰므로 Explicit Seg Loss는 보조적 역할임)
-        
-        # 여기서는 구현의 단순화를 위해, Backbone Features가 마스크 영역에서
-        # 높은 activation을 갖도록 유도하는 방식을 생략하고 Cls Loss에 집중하거나,
-        # 만약 모델 내부에 Auxiliary Seg Head가 있다면 그 출력을 사용함.
-        # (README 설계상 L_seg는 Backbone 학습용이라고 명시됨)
-        
+        # B. Segmentation Loss (Concept-Specific) [Fix for Sub-Concepts]
         if outputs['spatial_sim_map'] is not None:
-            spatial_sim = outputs['spatial_sim_map'] # [B, 4, 7, 7] (값 범위: -1 ~ 1)
+            spatial_sim = outputs['spatial_sim_map'] # 현재 shape: [B, 20, 7, 7]
             
-            # 마스크 리사이징 (Nearest)
+            # 1. 마스크 리사이징
             masks_resized = F.interpolate(masks, size=spatial_sim.shape[2:], mode='nearest') # [B, 4, 7, 7]
             
-            # Cosine Similarity(-1~1)를 확률(0~1)로 변환
-            # (sim + 1) / 2
-            spatial_probs = (spatial_sim + 1) * 0.5
+            # 2. [New] Sub-Concept Aggregation (20ch -> 4ch)
+            # "출혈"에 해당하는 5개 서브 프로토타입 중 가장 유사도가 높은 것을 대표값으로 사용
+            batch, total_k, h, w = spatial_sim.shape
+            num_sub = total_k // self.num_concepts # 20 // 4 = 5
             
-            # Pixel-wise BCE Loss 계산
+            # [B, 4, 5, 7, 7] 형태로 변환
+            sim_reshaped = spatial_sim.view(batch, self.num_concepts, num_sub, h, w)
+            
+            # Max Pooling over Sub-concepts (dim=2)
+            # 결과: [B, 4, 7, 7]
+            spatial_sim_aggregated, _ = torch.max(sim_reshaped, dim=2)
+            
+            # 3. 확률 변환 (Cosine Sim -1~1 -> Prob 0~1)
+            # 주의: Scale Factor가 이미 곱해져 있다면 Sigmoid를 써야 하고, 
+            # 순수 Cosine Sim이라면 Linear Mapping을 해야 합니다.
+            # PrototypeBank의 compute_spatial_similarity는 아직 Scaling 전의 raw cosine 값을 줍니다.
+            # 따라서 (sim + 1) * 0.5 가 안전합니다.
+            spatial_probs = (spatial_sim_aggregated + 1) * 0.5
+            
+            # 4. Loss 계산
             loss_seg = F.binary_cross_entropy(spatial_probs, masks_resized)
         else:
             loss_seg = torch.tensor(0.0, device=logits.device)
@@ -98,26 +100,24 @@ class DICANLoss(nn.Module):
         logits = outputs['logits']        # [B, 5]
         concept_scores = outputs['concept_scores'] # [B, 4] (Cosine Sim)
         
-        # ---------------------------------------------------------
-        # Loss 1: Alignment Loss (Weakly Supervised Metric Learning)
-        # ---------------------------------------------------------
-        # 라벨(Grade)을 보고 "있어야 할 Concept"을 추론
+        # 1. Alignment Loss (Max Pooling for Sub-concepts)
+        # [B, 20] -> [B, 4, 5] -> [B, 4] (각 컨셉별 최댓값 추출)
+        batch_size = concept_scores.size(0)
+        scores_reshaped = concept_scores.view(batch_size, self.num_concepts, -1) # -1 is num_sub_concepts
+        
+        # Max Pooling: 서브 컨셉 중 가장 유사한 것 하나를 대표값으로 사용
+        concept_max_scores, _ = torch.max(scores_reshaped, dim=2) 
+        
+        # Sigmoid로 0~1 변환
+        concept_probs = torch.sigmoid(concept_max_scores)
+        
         expected_concepts = self.concept_rule_matrix[labels] # [B, 4]
-        
-        # Projector가 뱉은 Concept Score가 Expected Concept과 같아지도록 유도
-        # (있어야 할 건 1에 가깝게, 없어야 할 건 0에 가깝게)
-        # Cosine Similarity는 -1~1 범위지만, PrototypeBank에서 보통 Normalize 등을 거침.
-        # 여기서는 0~1 범위로 가정하거나 BCEWithLogits 사용.
-        
-        # Cosine Sim(-1~1)을 0~1 확률로 매핑 (Calibration)
-        concept_probs = (concept_scores + 1) / 2 
         loss_align = F.binary_cross_entropy(concept_probs, expected_concepts)
-        
-        # ---------------------------------------------------------
-        # Loss 2: Ordinal Regression Loss (Under-diagnosis Penalty)
-        # ---------------------------------------------------------
-        # 기본 CE Loss
-        ce_loss = F.cross_entropy(logits, labels, reduction='none')
+
+        # 2. Ordinal Loss (Class Weight 적용 추천!)
+        # 여기는 Head가 20개 입력을 다 받아서 처리했으므로 logits 그대로 사용
+        class_weights = torch.tensor([0.5, 2.0, 2.0, 3.0, 3.0], device=logits.device)
+        ce_loss = F.cross_entropy(logits, labels, weight=class_weights, reduction='none')
         
         # 예측된 클래스 (argmax)
         pred_labels = torch.argmax(logits, dim=1)

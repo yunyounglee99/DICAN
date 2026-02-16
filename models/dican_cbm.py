@@ -18,7 +18,7 @@ class DICAN_CBM(nn.Module):
       상이한 동작 방식(Logic)을 하나의 모델 안에서 스위칭함.
     """
     
-    def __init__(self, num_concepts=4, num_classes=5, feature_dim=2048):
+    def __init__(self, num_concepts=4, num_classes=5, feature_dim=2048, num_sub_concepts=5):
         super(DICAN_CBM, self).__init__()
         self.mode = 'base' # 기본 모드 설정
 
@@ -31,11 +31,11 @@ class DICAN_CBM(nn.Module):
         
         # 3. Prototype Bank (Concept Anchors)
         # 마스크 연산 및 유사도 계산 담당.
-        self.prototypes = PrototypeBank(num_concepts=num_concepts, feature_dim=feature_dim)
+        self.prototypes = PrototypeBank(num_concepts=num_concepts, feature_dim=feature_dim, num_sub_concepts=num_sub_concepts)
         
         # 4. Reasoning Head (Ordinal Regression)
         # Concept Score -> DR Grade 예측.
-        self.head = OrdinalRegressionHead(num_concepts=num_concepts, num_classes=num_classes)
+        self.head = OrdinalRegressionHead(num_concepts=num_concepts, num_classes=num_classes, num_sub_concepts=num_sub_concepts)
 
     def forward(self, x, masks=None):
         """
