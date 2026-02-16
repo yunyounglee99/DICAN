@@ -383,14 +383,18 @@ def log_extra_metrics(args, metric: float, metric_mask_class: float, metric_name
         epoch: The epoch number (optional).
         prefix: The prefix for the metrics (default="RESULT").
     """
+    if not args.disable_log:
+        # 값이 None이면 "N/A" 문자열로 대체, 아니면 소수점 포맷팅 적용
+        val1 = f"{metric:.2f}" if metric is not None else "N/A"
+        val2 = f"{metric_mask_class:.2f}" if metric_mask_class is not None else "N/A"
 
-    print(f'{metric_name}: [Class-IL]: {metric:.2f} \t [Task-IL]: {metric_mask_class:.2f}', file=sys.stderr)
-    print(f'\tRaw {metric_name} values: Class-IL {metric} | Task-IL {metric_mask_class}', file=sys.stderr)
+        print(f'{metric_name}: [Class-IL]: {val1} \t [Task-IL]: {val2}', file=sys.stderr)
+        print(f'\tRaw {metric_name} values: Class-IL {metric} | Task-IL {metric_mask_class}', file=sys.stderr)
 
-    log_dict = {f'{prefix}_class_{metric_name}': metric, f'{prefix}_task_{metric_name}': metric_mask_class, 'Task': t}
+        log_dict = {f'{prefix}_class_{metric_name}': metric, f'{prefix}_task_{metric_name}': metric_mask_class, 'Task': t}
 
-    if not args.nowand:
-        wandb.log(log_dict)
+        if not args.nowand:
+            wandb.log(log_dict)
 
 
 def print_mean_accuracy(accs: np.ndarray, task_number: int,
