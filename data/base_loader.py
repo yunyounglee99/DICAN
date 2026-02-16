@@ -133,7 +133,7 @@ if __name__ == "__main__":
     # [설정] 실제 데이터셋이 있는 경로로 맞춰주세요.
     # 아까 100GB 받으신 경로: /root/DICAN_DATASETS/DDR
     # -------------------------------------------------------------------------
-    DATA_ROOT = '/root/DICAN_DATASETS/DDR'
+    DATA_ROOT = '/Volumes/Nyoungs_SSD/macbook/dev/datasets/DICAN_DATASETS/DDR'
     
     print(f"[*] Testing DDRBaseDataset with root: {DATA_ROOT}\n")
     

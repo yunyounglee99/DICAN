@@ -294,7 +294,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # [사용자 설정] 실제 데이터셋이 있는 루트 폴더 경로로 수정해주세요.
     # 예: '/Users/nyoung/DICAN_DATASETS'
-    DATA_ROOT = '/root/DICAN_DATASETS' 
+    DATA_ROOT = '/Volumes/Nyoungs_SSD/macbook/dev/datasets/DICAN_DATASETS/DDR' 
     # -------------------------------------------------------------------------
 
     print(f"[*] Testing Incremental Loader with DATA_ROOT: {DATA_ROOT}\n")
