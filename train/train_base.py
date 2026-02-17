@@ -2,13 +2,18 @@
 DICAN Base Training - 3-Phase (Pixel-Level Seg Supervision)
 =============================================================
 Phase 1-A: Backbone + TempHead + SegDecoder 학습
-           - L_cls: GAP → TempHead → CE (등급 분류)
-           - L_seg: SegDecoder → [B,4,224,224] → BCE with 원본 마스크 ★
-           Backbone이 pixel 단위로 "여기에 MA가 있다"를 학습
+           - L_cls: 전체 샘플 → CE (등급 분류)
+           - L_seg: 마스크가 있는 샘플만 → Focal BCE (병변 위치)
+           ★ DDR 275개 + FGADR ~1565개 = ~1840개 마스크 샘플
 
 Phase 1-B: Backbone Freeze → Masked GAP → Prototype 추출
 
 Phase 1-C: Backbone + Prototype Freeze → CBM Head 학습
+           ★ seg_pred 관련 코드 완전 제거 (head_train 모드에서 None)
+
+[버그 수정 2건]
+1. Phase 1-A: labels > 0 → masks.sum() > 0 (실제 마스크 존재 여부로 필터링)
+2. Phase 1-C: seg_pred[has_lesion] → 삭제 (head_train 모드에서 seg_pred=None)
 """
 
 import os
@@ -29,6 +34,7 @@ class BaseTrainer:
         self.val_loader = val_loader
 
     def check_data_statistics(self):
+        """데이터 통계 + 마스크 커버리지 출력"""
         print(f"\n[{'='*10} Data Statistics {'='*10}]")
         print(f"  Train: {len(self.train_loader.dataset)} samples")
         print(f"  Valid: {len(self.val_loader.dataset)} samples")
@@ -39,6 +45,12 @@ class BaseTrainer:
             if 'masks' in batch:
                 masks = batch['masks']
                 print(f"  Masks: {masks.shape}")
+                
+                # ★ 배치 내 마스크 존재 비율
+                has_any_mask = (masks.sum(dim=(1,2,3)) > 0).sum().item()
+                print(f"  Batch mask coverage: {has_any_mask}/{masks.size(0)} images "
+                      f"({100*has_any_mask/masks.size(0):.0f}%)")
+                
                 for k, name in enumerate(["EX", "HE", "MA", "SE"]):
                     active_imgs = (masks[:, k].sum(dim=(1,2)) > 0).sum().item()
                     active_pixels = (masks[:, k] > 0).sum().item()
@@ -46,6 +58,15 @@ class BaseTrainer:
                     ratio = 100.0 * active_pixels / total_pixels
                     print(f"    {name}: {active_imgs}/{masks.size(0)} images, "
                           f"{active_pixels:,} pixels ({ratio:.2f}%)")
+                
+                # 마스크 값 검증
+                unique_vals = torch.unique(masks)
+                print(f"  Mask unique values: {unique_vals.tolist()}")
+                if 1.0 in unique_vals:
+                    print("  ✅ 마스크에 양성 픽셀 존재 (정상)")
+                else:
+                    print("  ⚠️ 마스크가 전부 0! 경로/로딩 문제 확인 필요")
+                    
         except Exception as e:
             print(f"  [Warning] {e}")
         print("=" * 35 + "\n")
@@ -55,21 +76,15 @@ class BaseTrainer:
     # =================================================================
     def phase_1a_pretrain(self):
         """
-        [핵심 차이: 7×7 vs 224×224]
+        [핵심 수정: 마스크 가용성 기반 필터링]
         
-        기존 (7×7):
-          SegHead([2048,7,7]) → [4,7,7]
-          mask를 7×7로 축소 → BCE
-          → 32×32 블록 단위로만 병변 유무 판단
-          → MA(수 픽셀) 완전 소실
-        
-        수정 (224×224):
-          SegDecoder(multi_scale) → [4,224,224]
-          원본 mask [4,224,224]과 직접 BCE
-          → 각 pixel에서 병변 유무 판단
-          → MA도 pixel 단위로 학습 가능
-          → Backbone의 layer1(56×56)까지 gradient 전파
-            → 고해상도 레벨에서도 병변 경계 인식
+        DDR + FGADR 합산 데이터:
+          - 전체: ~8677개 (DDR 6835 + FGADR ~1842)
+          - 마스크 있음: ~2117개 (DDR 275 + FGADR ~1842)
+          
+        필터링 기준:
+          ❌ labels > 0 (틀림: Grade 1~4여도 마스크 없는 이미지 대다수)
+          ✅ masks.sum() > 0 (올바름: 실제 마스크 파일이 로드된 샘플만)
         """
         print(f"\n{'='*60}")
         print(f"  Phase 1-A: Backbone + Pixel-Level Seg (224×224)")
@@ -91,12 +106,11 @@ class BaseTrainer:
         
         class_weights = torch.tensor([0.5, 2.0, 2.0, 3.0, 3.0], device=self.device)
         
-        # Seg Loss 가중치
-        # 너무 크면 분류를 희생하고 세그에만 집중
-        # 너무 작으면 Backbone이 위치를 못 배움
-        lambda_seg = 1e+4
+        # Seg Loss 가중치 (FGADR 추가로 마스크 샘플 충분해짐 → 적절한 값)
+        lambda_seg = 100.0
         
         best_val_acc = 0.0
+        total_masked_samples = 0
         
         for epoch in range(epochs):
             self.model.train()
@@ -108,39 +122,42 @@ class BaseTrainer:
             total_seg = 0.0
             correct = 0
             total = 0
+            epoch_masked = 0
             
             loop = tqdm(self.train_loader, desc=f"[1-A] Epoch {epoch+1}/{epochs}")
             
             for batch_data in loop:
                 images = batch_data['image'].to(self.device)
                 labels = batch_data['label'].to(self.device)
-                masks = batch_data['masks'].to(self.device).float()  # [B, 4, 224, 224]
+                masks = batch_data['masks'].to(self.device).float()
                 
                 optimizer.zero_grad()
                 
                 outputs = self.model(images)
-                cls_logits = outputs['logits']      # [B, 5]
-                seg_pred = outputs['seg_pred']       # [B, 4, 224, 224] ★ pixel-level
+                cls_logits = outputs['logits']
+                seg_pred = outputs['seg_pred']
                 
-                # ─── Classification Loss ───
+                # ─── Classification Loss (전체 샘플) ───
                 loss_cls = F.cross_entropy(cls_logits, labels, weight=class_weights)
                 
-                # ─── Pixel-Level Segmentation Loss ───
-                # seg_pred: [B, 4, 224, 224] (logits)
-                # masks:    [B, 4, 224, 224] (binary: 0 or 1)
-                # 마스크를 리사이징할 필요 없음! 같은 해상도에서 직접 비교!
-                #
-                # Focal Loss 적용: 병변 pixel이 전체의 1~5%이므로
-                # 쉬운 배경 pixel의 loss를 줄이고 어려운 병변 pixel에 집중
-                loss_seg = self._focal_bce_loss(seg_pred, masks, gamma=2.0, alpha=0.75)
+                # ─── Seg Loss (마스크가 실제 존재하는 샘플만) ───
+                # ★★★ 핵심 수정: labels > 0 대신 masks.sum() > 0 ★★★
+                has_mask = (masks.sum(dim=(1, 2, 3)) > 0)  # [B] boolean
+                
+                if has_mask.any():
+                    loss_seg = self._focal_bce_loss(
+                        seg_pred[has_mask],
+                        masks[has_mask],
+                        gamma=2.0, alpha=0.75
+                    )
+                    epoch_masked += has_mask.sum().item()
+                else:
+                    loss_seg = torch.tensor(0.0, device=self.device)
                 
                 loss = loss_cls + lambda_seg * loss_seg
                 
                 loss.backward()
-                
-                # Gradient Clipping (Decoder가 커서 gradient 폭발 방지)
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=5.0)
-                
                 optimizer.step()
                 
                 total_loss += loss.item()
@@ -158,13 +175,14 @@ class BaseTrainer:
                 })
             
             scheduler.step()
+            total_masked_samples += epoch_masked
             train_acc = 100. * correct / total
             avg_seg = total_seg / len(self.train_loader)
             
             val_acc = self._validate_pretrain(class_weights)
             
             print(f"  Epoch {epoch+1}: Train={train_acc:.1f}%, Val={val_acc:.1f}%, "
-                  f"SegLoss={avg_seg:.4f}")
+                  f"SegLoss={lambda_seg*avg_seg:.4f}, MaskedSamples={epoch_masked}")
             
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
@@ -172,39 +190,21 @@ class BaseTrainer:
                 print(f"  ★ Best: {val_acc:.2f}%")
         
         self.load_model("phase1a_best.pth")
+        
+        print(f"\n  [Info] Total masked samples seen: {total_masked_samples} "
+              f"(~{total_masked_samples//max(epochs,1)} per epoch)")
         self._verify_seg_quality_pixel_level()
         
         print(f"\n[1-A] Complete. Best Val Acc: {best_val_acc:.2f}%")
         return best_val_acc
 
     def _focal_bce_loss(self, pred, target, gamma=2.0, alpha=0.75):
-        """
-        Focal Loss for Binary Segmentation
-        
-        [왜 Focal Loss인가?]
-        DR 이미지에서 병변 pixel은 전체의 1~5%.
-        일반 BCE를 쓰면 95%의 배경 pixel이 loss를 지배하여
-        모델이 "전부 0으로 예측"하는 것이 가장 쉬운 해법이 됨.
-        
-        Focal Loss는:
-        - 이미 잘 맞추는 배경 pixel의 loss를 γ 제곱으로 줄이고
-        - 틀리기 쉬운 병변 pixel의 loss는 유지
-        → 병변 경계(어려운 pixel)에 집중
-        
-        alpha: 양성(병변) pixel에 대한 가중치 (0.75 = 병변에 3배 가중)
-        gamma: focusing parameter (2.0이 표준)
-        """
+        """Focal Loss for pixel-level binary segmentation"""
         bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
-        
         p = torch.sigmoid(pred)
-        pt = p * target + (1 - p) * (1 - target)  # 맞힌 확률
-        
-        # Focal weight: 쉬운 sample은 (1-pt)^γ → 0에 가까워짐
+        pt = p * target + (1 - p) * (1 - target)
         focal_weight = (1.0 - pt) ** gamma
-        
-        # Alpha weight: 양성 pixel에 더 큰 가중치
         alpha_weight = alpha * target + (1 - alpha) * (1 - target)
-        
         loss = alpha_weight * focal_weight * bce
         return loss.mean()
 
@@ -223,14 +223,11 @@ class BaseTrainer:
         return 100. * correct / total
 
     def _verify_seg_quality_pixel_level(self):
-        """
-        224×224 해상도에서 Segmentation 품질 검증
-        Dice Score로 각 병변별 검출 성능 측정
-        """
+        """224×224 해상도에서 Segmentation 품질 검증"""
         print("\n[*] Pixel-Level Segmentation Quality (224×224):")
         self.model.eval()
-        self.model.set_session_mode('pretrain')  # SegDecoder 접근 필요
-        self.model.eval()  # 다시 eval
+        self.model.set_session_mode('pretrain')
+        self.model.eval()
         
         concept_names = ["EX", "HE", "MA", "SE"]
         dice_scores = {k: [] for k in range(4)}
@@ -242,17 +239,23 @@ class BaseTrainer:
                 images = batch_data['image'].to(self.device)
                 masks = batch_data['masks'].to(self.device).float()
                 
-                # Multi-scale forward
+                # ★ 마스크가 있는 배치만 Dice 계산
+                has_mask = (masks.sum(dim=(1, 2, 3)) > 0)
+                if not has_mask.any():
+                    count += 1
+                    if count >= 50:
+                        break
+                    continue
+                
                 feat4, multi_scale = self.model.backbone(images, return_multi_scale=True)
-                seg_pred = self.model.seg_decoder(multi_scale)  # [B, 4, 224, 224]
+                seg_pred = self.model.seg_decoder(multi_scale)
                 seg_binary = (torch.sigmoid(seg_pred) > 0.5).float()
                 
                 for k in range(4):
-                    pred_k = seg_binary[:, k]   # [B, 224, 224]
-                    gt_k = masks[:, k]           # [B, 224, 224]
+                    pred_k = seg_binary[:, k]
+                    gt_k = masks[:, k]
                     
-                    # 병변이 있는 이미지만
-                    has_lesion = (gt_k.sum(dim=(1,2)) > 0)
+                    has_lesion = (gt_k.sum(dim=(1, 2)) > 0)
                     if has_lesion.any():
                         p = pred_k[has_lesion]
                         g = gt_k[has_lesion]
@@ -267,10 +270,10 @@ class BaseTrainer:
                             iou_scores[k].append((intersection / union_iou).item())
                 
                 count += 1
-                if count >= 30:
+                if count >= 50:
                     break
         
-        print(f"  {'Concept':>8} | {'Dice':>8} | {'IoU':>8} | {'Samples':>8}")
+        print(f"  {'Concept':>8} | {'Dice':>8} | {'IoU':>8} | {'Batches':>8}")
         print(f"  {'-'*40}")
         for k, name in enumerate(concept_names):
             if dice_scores[k]:
@@ -280,30 +283,12 @@ class BaseTrainer:
                 print(f"  {name:>8} | {d:>8.4f} | {i:>8.4f} | {n:>8}")
             else:
                 print(f"  {name:>8} | {'N/A':>8} | {'N/A':>8} | {'0':>8}")
-        
-        print(f"\n  해석 기준:")
-        print(f"    Dice > 0.5: 병변 위치를 잘 인식함 (Good)")
-        print(f"    Dice 0.3~0.5: 대략적 위치는 알지만 경계가 부정확 (OK)")
-        print(f"    Dice < 0.3: 병변 인식이 부족 → lambda_seg 증가 필요")
-        print(f"    MA의 Dice가 낮은 것은 정상 (극소 병변)")
         print()
 
     # =================================================================
     # Phase 1-B: Prototype Extraction
     # =================================================================
     def phase_1b_extract_prototypes(self):
-        """
-        Backbone이 pixel-level seg 학습을 거쳤으므로:
-        - feature map [2048, 7, 7]의 각 위치가 해당 영역의 병변 특성을 인코딩
-        - Masked GAP 시 마스크 영역의 feature = 병변 고유 특징 벡터
-        - Prototype 품질이 7×7 seg 학습 대비 훨씬 향상됨
-        
-        특히 MA:
-        - 7×7에서는 MA pixel이 사라져서 prototype이 부정확했음
-        - 224×224에서 학습했으므로 Backbone의 layer1~3이
-          MA의 미세한 특징까지 인코딩하고 있고,
-          이것이 layer4의 7×7까지 전파되어 있음
-        """
         print(f"\n{'='*60}")
         print(f"  Phase 1-B: Prototype Extraction")
         print(f"{'='*60}")
@@ -325,8 +310,15 @@ class BaseTrainer:
 
     # =================================================================
     # Phase 1-C: Head Training
+    # ★★★ seg_pred 관련 코드 완전 제거 ★★★
+    # head_train 모드에서 seg_pred=None이므로 접근하면 TypeError 발생
     # =================================================================
     def phase_1c_train_head(self):
+        """
+        CBM Head만 학습하는 Phase.
+        Backbone, Prototype 모두 Frozen.
+        seg_pred는 None이므로 절대 참조하지 않음.
+        """
         print(f"\n{'='*60}")
         print(f"  Phase 1-C: CBM Head Training")
         print(f"{'='*60}")
@@ -355,32 +347,24 @@ class BaseTrainer:
             for batch_data in loop:
                 images = batch_data['image'].to(self.device)
                 labels = batch_data['label'].to(self.device)
-                masks = batch_data['masks'].to(self.device)
                 
                 optimizer.zero_grad()
                 
                 outputs = self.model(images)
                 logits = outputs['logits']
                 concept_scores = outputs['concept_scores']
-                seg_pred = outputs['seg_pred']
                 
+                # ─── Classification Loss ───
                 loss_cls = F.cross_entropy(logits, labels, weight=class_weights)
-
-                has_lesion = (labels > 0)
-                if has_lesion.any():
-                    loss_seg = self._focal_bce_loss(
-                        seg_pred[has_lesion],
-                        masks[has_lesion],
-                        gamma=2.0, alpha=0.75
-                    )
                 
-                # Sparsity
+                # ─── Sparsity: Grade 0은 concept 비활성화 ───
                 loss_sp = torch.tensor(0.0, device=self.device)
                 normal = (labels == 0)
                 if normal.any() and concept_scores is not None:
                     max_scores = concept_scores[normal, :self.model.num_concepts]
                     loss_sp = torch.relu(max_scores).mean()
                 
+                # ★ seg_pred 관련 코드 없음 (head_train에서 None이므로)
                 loss = loss_cls + 0.3 * loss_sp
                 loss.backward()
                 optimizer.step()
@@ -460,7 +444,7 @@ class BaseTrainer:
     # =================================================================
     def run(self):
         print(f"\n{'='*60}")
-        print(f"  DICAN 3-Phase Training (Pixel-Level Seg)")
+        print(f"  DICAN 3-Phase Training (DDR + FGADR)")
         print(f"{'='*60}")
         self.check_data_statistics()
         
