@@ -31,11 +31,11 @@ class DICAN_CBM(nn.Module):
         
         # 3. Prototype Bank (Concept Anchors)
         # 마스크 연산 및 유사도 계산 담당.
-        self.prototypes = PrototypeBank(num_concepts=num_concepts, feature_dim=feature_dim, num_sub_concepts=num_sub_concepts)
+        self.prototypes = PrototypeBank(num_concepts=num_concepts, feature_dim=feature_dim)
         
         # 4. Reasoning Head (Ordinal Regression)
         # Concept Score -> DR Grade 예측.
-        self.head = OrdinalRegressionHead(num_concepts=num_concepts, num_classes=num_classes, num_sub_concepts=num_sub_concepts)
+        self.head = OrdinalRegressionHead(num_concepts=num_concepts, num_classes=num_classes)
 
     def forward(self, x, masks=None):
         """

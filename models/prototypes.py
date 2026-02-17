@@ -25,13 +25,12 @@ class PrototypeBank(nn.Module):
 
         # 프로토타입 저장소 (학습 파라미터가 아님 -> register_buffer)
         # shape: [4, 2048]
-        self.total_prototypes = num_concepts * num_sub_concepts
-        self.register_buffer("prototypes", torch.zeros(self.total_prototypes, feature_dim))
+        self.register_buffer("prototypes", torch.zeros(self.num_concepts, feature_dim))
         
         # 초기화 여부 확인용
         self.register_buffer("initialized", torch.zeros(1, dtype=torch.bool))
 
-        self.scale_factor = 20
+        self.logit_scale = nn.Parameter(torch.ones([]) * 4.6052) # ln(100) approx 4.6
 
     def forward(self, features):
         """
@@ -56,12 +55,14 @@ class PrototypeBank(nn.Module):
         
         # 4. [Scale Factor 적용] 신호 증폭 (필수!)
         # -1~1 사이 값을 -10~10으로 뻥튀기해야 Head가 학습됨
-        spatial_sim_map = spatial_sim_map * self.scale_factor # scale_factor=20.0 추천
+        scale = self.logit_scale.exp().clamp(max=100.0)
+        spatial_sim_map = spatial_sim_map * scale # scale_factor=20.0 추천
 
         # 5. Spatial Aggregation (Pixel -> Image Level Score)
         # "어디선가 병변이 강하게 떴다면 그것은 병변이다" -> Max Pooling
         # [B, K, 7, 7] -> [B, K]
-        concept_scores = F.max_pool2d(spatial_sim_map, kernel_size=(h, w)).view(batch, -1)
+        flat_sim = spatial_sim_map.flatten(2)
+        concept_scores = torch.logsumexp(flat_sim, dim=2)
         
         return concept_scores, spatial_sim_map
     

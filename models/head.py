@@ -16,7 +16,7 @@ class OrdinalRegressionHead(nn.Module):
     - Base Session 이후에는 이 논리가 변하면 안 되므로 파라미터를 Freeze함.
     """
 
-    def __init__(self, num_concepts=4, num_classes=5, num_sub_concepts=5, hidden_dims=[32, 16], dropout=0.0):
+    def __init__(self, num_concepts=4, num_classes=5, hidden_dims=[32, 16], dropout=0.2):
         """
         Args:
             num_concepts (int): 입력 차원 (Concept 개수, DDR=4)
@@ -25,28 +25,17 @@ class OrdinalRegressionHead(nn.Module):
             dropout (float): 과적합 방지를 위한 Dropout 비율
         """
         super(OrdinalRegressionHead, self).__init__()
-        self.num_concepts = num_concepts
-        self.num_classes = num_classes
-        
-        # 1. MLP 레이어 구축
-        layers = []
-        in_dim = num_concepts * num_sub_concepts
-        
-        for h_dim in hidden_dims:
-            layers.append(nn.Linear(in_dim, h_dim))
-            layers.append(nn.BatchNorm1d(h_dim)) # 입력값(Concept Score) 분포 안정화
-            layers.append(nn.ReLU(inplace=True))
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            in_dim = h_dim
-            
-        # 2. 최종 출력층 (Logits for Ordinal Loss)
-        # 중요: Ordinal Regression에서는 보통 (Class - 1)개의 이진 분류기를 두거나
-        # 단순히 Class 개수만큼의 Logits를 뽑고 Loss에서 처리하기도 함.
-        # 여기서는 가장 유연한 방식인 'Class 개수만큼 Logits 출력'을 사용.
-        layers.append(nn.Linear(in_dim, num_classes))
-        
-        self.mlp = nn.Sequential(*layers)
+
+        in_dim = num_concepts
+
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(32, num_classes)
+        )
+
         
         # 가중치 초기화
         self._init_weights()
