@@ -3,79 +3,70 @@ import torch.nn as nn
 
 class OrdinalRegressionHead(nn.Module):
     """
-    DICAN 모델의 추론 모듈 (Reasoning Head).
+    DICAN Reasoning Head - Hybrid Pooling 대응 버전
     
-    [핵심 역할]
-    1. Input: PrototypeBank에서 계산된 'Concept Score' (예: [출혈점수, 삼출물점수...])
-    2. Output: DR 등급 (Level 0 ~ 4)에 대한 Logits.
-    3. Logic: "출혈 점수가 높으면 중증이다"와 같은 의학적 인과관계를 학습함.
+    [변경사항]
+    - 입력 차원이 num_concepts(4)에서 num_concepts*2(8)로 확장
+    - Max Score(4) + Mean Score(4)를 동시에 받아 진단 논리 학습
+    - 의학적 의미: "병변이 있는가(Max)" + "얼마나 퍼졌는가(Mean)" 모두 고려
     
-    [Ordinal Regression 구조]
-    - DR 등급은 순서가 중요하므로(0 < 1 < 2 < 3 < 4), 단순 분류보다는 
-      순서 정보를 보존할 수 있는 구조가 유리함.
-    - Base Session 이후에는 이 논리가 변하면 안 되므로 파라미터를 Freeze함.
+    [Ordinal Regression]
+    - DR 등급 순서(0<1<2<3<4)를 보존하는 구조
+    - Base Session 이후 Frozen하여 진단 논리 고정
     """
 
-    def __init__(self, num_concepts=4, num_classes=5, hidden_dims=[32, 16], dropout=0.2):
+    def __init__(self, input_dim=8, num_classes=5, dropout=0.2):
         """
         Args:
-            num_concepts (int): 입력 차원 (Concept 개수, DDR=4)
-            num_classes (int): 출력 클래스 개수 (DR Grade=5)
-            hidden_dims (list): MLP 은닉층의 차원 리스트
-            dropout (float): 과적합 방지를 위한 Dropout 비율
+            input_dim (int): Concept Score 차원 (Hybrid: num_concepts * 2 = 8)
+            num_classes (int): DR Grade 개수 (0~4 = 5)
+            dropout (float): 과적합 방지
         """
         super(OrdinalRegressionHead, self).__init__()
+        
+        self.input_dim = input_dim
 
-        in_dim = num_concepts
-
+        # [구조 설계 근거]
+        # 8 → 32: Concept 간 상호작용 학습 (예: HE_max + EX_mean의 조합)
+        # 32 → 16: 압축하면서 노이즈 필터링
+        # 16 → 5: 최종 등급 예측
         self.mlp = nn.Sequential(
-            nn.Linear(in_dim, 32),
+            nn.Linear(input_dim, 32),
             nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(32, num_classes)
+            nn.Dropout(dropout),
+            nn.Linear(32, 16),
+            nn.BatchNorm1d(16),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(16, num_classes)
         )
-
         
-        # 가중치 초기화
         self._init_weights()
 
     def forward(self, concept_scores):
         """
         Args:
-            concept_scores (Tensor): [Batch, num_concepts] (0~1 사이의 유사도 값)
+            concept_scores: [B, input_dim] 
+                           처음 input_dim//2는 Max scores, 나머지는 Mean scores
         Returns:
-            logits (Tensor): [Batch, num_classes] (Softmax 전의 값)
+            logits: [B, num_classes]
         """
         return self.mlp(concept_scores)
 
     def set_session_mode(self, mode):
-        """
-        학습 단계(Session)에 따라 Head의 상태를 제어하는 함수.
-        
-        [전략]
-        - Base Session: 학습 가능 (진단 논리를 배움)
-        - Incremental Session: 완전 고정 (Freeze)
-          -> 병원이 바뀌어도 "출혈이 많으면 중증"이라는 사실은 변하지 않기 때문.
-          -> Head가 고정되어야 Projector가 Head의 기준에 맞춰 Feature를 정렬(Align)하려고 노력함.
-        """
         if mode == 'base':
-            # Base: 학습 모드
             for param in self.parameters():
                 param.requires_grad = True
             self.train()
-            
         elif mode == 'incremental':
-            # Incremental: 고정 모드 (Frozen Logic)
             for param in self.parameters():
                 param.requires_grad = False
-            self.eval() # BN 통계량도 고정
-            
+            self.eval()
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
     def _init_weights(self):
-        """학습 초기 안정성을 위한 초기화"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -85,21 +76,20 @@ class OrdinalRegressionHead(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-# --- 테스트 코드 ---
+
+# --- 테스트 ---
 if __name__ == "__main__":
-    # Head 초기화 (Concept 4개 -> Class 5개)
-    head = OrdinalRegressionHead(num_concepts=4, num_classes=5)
+    head = OrdinalRegressionHead(input_dim=8, num_classes=5)
     
-    # 더미 입력 (Batch=2, Concept=4)
-    # 예: 첫 번째 환자는 Concept 점수가 높음 (중증), 두 번째는 낮음 (정상)
-    dummy_scores = torch.tensor([[0.9, 0.8, 0.7, 0.9], 
-                                [0.1, 0.0, 0.1, 0.0]])
+    # Hybrid Score 시뮬레이션
+    # [max_EX, max_HE, max_MA, max_SE, mean_EX, mean_HE, mean_MA, mean_SE]
+    severe_patient = torch.tensor([[15.0, 12.0, 8.0, 10.0,  5.0, 4.0, 3.0, 4.0]])  # 중증
+    normal_patient = torch.tensor([[-2.0, -3.0, -1.0, -2.0, -1.0, -1.5, -0.5, -1.0]])  # 정상
     
-    # 1. Base Session 테스트
+    batch = torch.cat([severe_patient, normal_patient], dim=0)
+    
     head.set_session_mode('base')
-    logits = head(dummy_scores)
-    print(f"[Base] Logits Shape: {logits.shape}") # [2, 5]
-    
-    # 2. Incremental Session 테스트
-    head.set_session_mode('incremental')
-    print(f"[Inc] Requires Grad: {list(head.parameters())[0].requires_grad}") # False
+    logits = head(batch)
+    print(f"Logits shape: {logits.shape}")  # [2, 5]
+    print(f"Severe prediction: Grade {logits[0].argmax().item()}")
+    print(f"Normal prediction: Grade {logits[1].argmax().item()}")

@@ -1,155 +1,259 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-# 앞서 정의한 모듈들을 상대 경로로 임포트
-# (실제 환경에서는 파일 위치에 따라 경로가 달라질 수 있음)
 from .backbone import ResNetBackbone
 from .projector import ConceptProjector
 from .prototypes import PrototypeBank
 from .head import OrdinalRegressionHead
 
+
 class DICAN_CBM(nn.Module):
     """
-    DICAN (Domain-Invariant Concept Alignment Network) 전체 모델 클래스.
+    DICAN - Phase 분리 + Segmentation Supervision 버전
     
-    [구조적 특징]
-    - 4개의 핵심 모듈을 조립하여 CBM 파이프라인을 구축함.
-    - 'set_session_mode'를 통해 Base Session과 Incremental Session의 
-      상이한 동작 방식(Logic)을 하나의 모델 안에서 스위칭함.
+    [핵심 설계]
+    Phase 1-A에서 Backbone이 두 가지를 동시에 학습:
+      (a) Classification: "이 이미지의 DR 등급은 무엇인가?" (GAP → TempHead)
+      (b) Segmentation:   "병변이 7×7 어디에 있는가?"      (SegHead → BCE with mask)
+    
+    → Backbone이 "병변 위치 인식(Spatial Awareness)"을 학습한 상태에서 고정됨
+    → Phase 1-B에서 Masked GAP로 추출하는 prototype의 품질이 극적으로 향상됨
+    
+    [Phase 구조]
+    Phase 1-A (pretrain):  Backbone + TempHead + SegHead 학습
+    Phase 1-B (extract):   Backbone Freeze → Masked Pooling → Prototype 구축
+    Phase 1-C (head_train): Backbone + Prototype Freeze → CBM Head 학습
+    Phase 2   (incremental): Projector만 학습
     """
     
-    def __init__(self, num_concepts=4, num_classes=5, feature_dim=2048, num_sub_concepts=50):
+    def __init__(self, num_concepts=4, num_classes=5, feature_dim=2048):
         super(DICAN_CBM, self).__init__()
-        self.mode = 'base' # 기본 모드 설정
+        self.num_concepts = num_concepts
+        self.num_classes = num_classes
+        self.feature_dim = feature_dim
+        self.mode = 'pretrain'
 
         # 1. Backbone (ResNet-50)
         self.backbone = ResNetBackbone(pretrained=True)
         
-        # 2. Concept Projector (Learnable Alignment Layer)
-        # Base Session에서는 Identity, Inc Session에서는 학습됨.
+        # 2. Concept Projector (Phase 2용)
         self.projector = ConceptProjector(input_dim=feature_dim)
         
-        # 3. Prototype Bank (Concept Anchors)
-        # 마스크 연산 및 유사도 계산 담당.
-        self.prototypes = PrototypeBank(num_concepts=num_concepts, feature_dim=feature_dim)
+        # 3. Prototype Bank (Hybrid Pooling)
+        self.prototypes = PrototypeBank(
+            num_concepts=num_concepts, 
+            feature_dim=feature_dim
+        )
         
-        # 4. Reasoning Head (Ordinal Regression)
-        # Concept Score -> DR Grade 예측.
-        self.head = OrdinalRegressionHead(num_concepts=num_concepts, num_classes=num_classes)
+        # 4. CBM Reasoning Head (Phase 1-C, Phase 2)
+        score_dim = self.prototypes.get_score_dim()
+        self.head = OrdinalRegressionHead(
+            input_dim=score_dim, 
+            num_classes=num_classes
+        )
+        
+        # 5. Temporary Classification Head (Phase 1-A, 이후 폐기)
+        self.temp_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(feature_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
+        
+        # =============================================
+        # 6. Segmentation Head (Phase 1-A) [★ 핵심]
+        #
+        #    Backbone [B, 2048, 7, 7] → SegHead → [B, 4, 7, 7]
+        #    각 Concept(EX, HE, MA, SE)별 공간 활성화 맵 예측
+        #
+        #    이것이 Backbone에게 가르치는 것:
+        #    "이 7×7 좌표에 출혈이 있다/없다"
+        #    "이 7×7 좌표에 삼출물이 있다/없다"
+        #
+        #    → feature map의 각 픽셀이 병변 유무를 인코딩하게 됨
+        #    → Phase 1-B의 Masked GAP에서 추출되는 벡터가
+        #      "진짜 병변 특징"을 담게 됨
+        # =============================================
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(feature_dim, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, num_concepts, kernel_size=1, bias=True)
+        )
+        
+        self._init_auxiliary_heads()
+
+    def _init_auxiliary_heads(self):
+        for module in [self.temp_head, self.seg_head]:
+            for m in module.modules():
+                if isinstance(m, (nn.Linear, nn.Conv2d)):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+                elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                    nn.init.constant_(m.weight, 1)
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x, masks=None):
-        """
-        Session Mode에 따라 데이터 흐름이 달라지는 Dynamic Forwarding.
         
-        Args:
-            x (Tensor): Input Image [Batch, 3, 224, 224]
-            masks (Tensor, optional): Segmentation Masks [Batch, 4, 224, 224]
-                                    (Base Session에서만 필수)
-        Returns:
-            output (dict): Loss 계산을 위한 모든 중간/최종 결과값 포함
-                - 'logits': 최종 DR 등급 예측값 (Ordinal Regression용)
-                - 'concept_scores': Concept 유사도/점수 (Intervention용)
-                - 'features': (Inc 모드일 때) Projector 통과 후 특징 (Alignment Loss용)
-        """
-        # 1. Backbone Feature Extraction (공통)
-        # [Batch, 2048, 7, 7]
-        raw_features = self.backbone(x)
+        # ===========================================================
+        # Phase 1-A: Pretrain
+        #   Backbone → feature [B,2048,7,7]
+        #              ├→ GAP → TempHead → cls_logits    (등급 분류)
+        #              └→ SegHead → seg_pred [B,4,7,7]   (병변 위치)
+        # ===========================================================
+        if self.mode == 'pretrain':
+            raw_features = self.backbone(x)
+            cls_logits = self.temp_head(raw_features)
+            seg_pred = self.seg_head(raw_features)
+            
+            return {
+                "logits": cls_logits,
+                "seg_pred": seg_pred,
+                "concept_scores": None,
+                "features": raw_features,
+                "spatial_sim_map": None
+            }
         
-        concept_scores = None
-        aligned_features = None
-        spatial_sim_map = None
-
-        # -----------------------------------------------------------
-        # CASE 1: Base Session (Masked GAP -> Prototype Update)
-        # -----------------------------------------------------------
-        if self.mode == 'base':
-            if masks is None:
-                raise ValueError("[Base Session] Segmentation masks are required for training!")
+        # ===========================================================
+        # Phase 1-C: Head Training
+        # ===========================================================
+        elif self.mode == 'head_train':
+            with torch.no_grad():
+                raw_features = self.backbone(x)
             
-            do_update = self.training
-            # Projector는 사용하지 않음 (Pass-through)
-            # 마스크를 사용하여 '진짜 병변' 특징만 추출하고 Prototype 업데이트
-            # 리턴값: 현재 배치의 Concept Score (Head 학습용)
-            concept_scores = self.prototypes.update_with_masks(raw_features, masks, do_update)
+            concept_scores, spatial_sim_map = self.prototypes(raw_features)
+            logits = self.head(concept_scores)
             
-            # Base Session에서는 Projector 출력이 의미가 없으므로 raw_features를 그대로 둠
-            aligned_features = raw_features 
-            spatial_sim_map = self.prototypes.compute_spatial_similarity(raw_features)
-
-        # -----------------------------------------------------------
-        # CASE 2: Incremental Session (Projector -> Similarity)
-        # -----------------------------------------------------------
+            return {
+                "logits": logits,
+                "seg_pred": None,
+                "concept_scores": concept_scores,
+                "features": raw_features.detach(),
+                "spatial_sim_map": spatial_sim_map.detach()
+            }
+        
+        # ===========================================================
+        # Phase 2: Incremental
+        # ===========================================================
         elif self.mode == 'incremental':
-            # Projector를 통과시켜 특징 공간 정렬 (Feature Transformation)
-            # [Batch, 2048, 7, 7]
+            with torch.no_grad():
+                raw_features = self.backbone(x)
+            
             aligned_features = self.projector(raw_features)
+            concept_scores, spatial_sim_map = self.prototypes(aligned_features)
+            logits = self.head(concept_scores)
             
-            # 저장된 Prototype과의 Cosine Similarity 계산
-            # [Batch, num_concepts]
-            concept_scores = self.prototypes(aligned_features)
+            return {
+                "logits": logits,
+                "seg_pred": None,
+                "concept_scores": concept_scores,
+                "features": aligned_features,
+                "spatial_sim_map": spatial_sim_map
+            }
+        
+        # ===========================================================
+        # Evaluation
+        # ===========================================================
+        elif self.mode == 'eval':
+            with torch.no_grad():
+                raw_features = self.backbone(x)
+                aligned_features = self.projector(raw_features)
+                concept_scores, spatial_sim_map = self.prototypes(aligned_features)
+                logits = self.head(concept_scores)
             
+            return {
+                "logits": logits,
+                "seg_pred": None,
+                "concept_scores": concept_scores,
+                "features": aligned_features,
+                "spatial_sim_map": spatial_sim_map
+            }
+        
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
-        # 3. Reasoning Head (Classification) (공통)
-        # [Batch, num_classes]
-        logits = self.head(concept_scores)
-        
-        return {
-            "logits": logits,
-            "concept_scores": concept_scores,
-            "features": aligned_features, # Alignment Loss 계산을 위해 필요
-            "spatial_sim_map": spatial_sim_map
-        }
-
     def set_session_mode(self, mode):
-        """
-        모든 서브 모듈에 Session Mode를 전파하여 Freeze/Unfreeze 상태를 동기화함.
+        valid_modes = ['pretrain', 'extract', 'head_train', 'incremental', 'eval']
+        if mode not in valid_modes:
+            raise ValueError(f"Unknown mode: {mode}. Valid: {valid_modes}")
         
-        Args:
-            mode (str): 'base' or 'incremental'
-        """
-        print(f"[*] Switching DICAN session mode to: {mode.upper()}")
+        print(f"\n[*] DICAN mode → {mode.upper()}")
         self.mode = mode
         
-        # 각 모듈별로 모드 설정 전파
-        self.backbone.set_session_mode(mode)
-        self.projector.set_session_mode(mode)
-        # PrototypeBank는 nn.Module이지만 학습 파라미터(Weight)가 없으므로 별도 모드 설정 불필요
-        # 단, 내부 상태 관리가 필요하다면 추가 가능.
-        self.head.set_session_mode(mode)
-
-        # 요약 출력
-        if mode == 'base':
-            print("   -> Backbone: Trainable (Fine-tuning)")
-            print("   -> Projector: Frozen (Identity)")
-            print("   -> Prototypes: Updating with Masks")
-            print("   -> Head: Trainable")
+        if mode == 'pretrain':
+            self.backbone.set_session_mode('base')
+            for p in self.temp_head.parameters():
+                p.requires_grad = True
+            self.temp_head.train()
+            for p in self.seg_head.parameters():
+                p.requires_grad = True
+            self.seg_head.train()
+            for p in self.projector.parameters():
+                p.requires_grad = False
+            self.projector.eval()
+            for p in self.head.parameters():
+                p.requires_grad = False
+            self.head.eval()
+            
+            print("   → Backbone: Trainable")
+            print("   → TempHead: Trainable (Classification)")
+            print("   → SegHead:  Trainable (Lesion Localization)")
+            print("   → Projector/CBM Head/Prototypes: Frozen")
+            
+        elif mode == 'extract':
+            self.backbone.set_session_mode('incremental')
+            self.eval()
+            print("   → All Frozen (Prototype extraction)")
+            
+        elif mode == 'head_train':
+            self.backbone.set_session_mode('incremental')
+            for p in self.projector.parameters():
+                p.requires_grad = False
+            self.projector.eval()
+            for p in self.head.parameters():
+                p.requires_grad = True
+            self.head.train()
+            self.prototypes.logit_scale.requires_grad = True
+            for p in self.seg_head.parameters():
+                p.requires_grad = False
+            self.seg_head.eval()
+            for p in self.temp_head.parameters():
+                p.requires_grad = False
+            self.temp_head.eval()
+            
+            print("   → Backbone: Frozen (lesion-aware features locked)")
+            print("   → Prototypes: Fixed (logit_scale trainable)")
+            print("   → CBM Head: Trainable")
+            
         elif mode == 'incremental':
-            print("   -> Backbone: Frozen")
-            print("   -> Projector: Trainable (Learning Alignment)")
-            print("   -> Prototypes: Fixed (Reference)")
-            print("   -> Head: Frozen")
+            self.backbone.set_session_mode('incremental')
+            self.projector.set_session_mode('incremental')
+            for p in self.head.parameters():
+                p.requires_grad = False
+            self.head.eval()
+            self.prototypes.logit_scale.requires_grad = False
+            print("   → Projector: Trainable")
+            print("   → Backbone + Head + Prototypes: Frozen")
+            
+        elif mode == 'eval':
+            self.eval()
+            for p in self.parameters():
+                p.requires_grad = False
 
-# --- 테스트 코드 ---
-if __name__ == "__main__":
-    # 모델 생성
-    model = DICAN_CBM()
-    
-    # 더미 데이터
-    images = torch.randn(2, 3, 224, 224)
-    masks = torch.randn(2, 4, 224, 224) # Base용 마스크
-    
-    # 1. Base Session 테스트
-    model.set_session_mode('base')
-    out_base = model(images, masks)
-    print(f"[Base] Logits Shape: {out_base['logits'].shape}")
-    print(f"[Base] Concept Scores Shape: {out_base['concept_scores'].shape}")
-    
-    # 2. Incremental Session 테스트
-    model.set_session_mode('incremental')
-    # 마스크 없이 이미지(Few-shot)만 입력
-    out_inc = model(images) 
-    print(f"[Inc] Logits Shape: {out_inc['logits'].shape}")
-    # Projector가 작동했는지 확인 (Projector 초기화에 따라 값 변화)
-    print(f"[Inc] Features Shape: {out_inc['features'].shape}")
+    def get_trainable_params(self):
+        if self.mode == 'pretrain':
+            params = (list(self.backbone.parameters()) + 
+                     list(self.temp_head.parameters()) + 
+                     list(self.seg_head.parameters()))
+        elif self.mode == 'head_train':
+            params = list(self.head.parameters()) + [self.prototypes.logit_scale]
+        elif self.mode == 'incremental':
+            params = list(self.projector.parameters())
+        else:
+            params = []
+        return [p for p in params if p.requires_grad]
