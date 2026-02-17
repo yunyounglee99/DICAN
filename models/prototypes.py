@@ -56,7 +56,7 @@ class PrototypeBank(nn.Module):
         # 4. [Scale Factor 적용] 신호 증폭 (필수!)
         # -1~1 사이 값을 -10~10으로 뻥튀기해야 Head가 학습됨
         scale = self.logit_scale.exp().clamp(max=100.0)
-        spatial_sim_map = spatial_sim_map * scale # scale_factor=20.0 추천
+        spatial_sim_map = spatial_sim_map #* scale # scale_factor=20.0 추천
 
         # 5. Spatial Aggregation (Pixel -> Image Level Score)
         # "어디선가 병변이 강하게 떴다면 그것은 병변이다" -> Max Pooling

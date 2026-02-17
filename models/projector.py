@@ -34,10 +34,11 @@ class ConceptProjector(nn.Module):
         # Linear 대신 Conv2d(1x1)를 쓰는 이유:
         # Backbone의 출력(7x7) 공간 정보를 유지하면서 픽셀(위치)별로 Alignment를 수행하기 위함.
         self.layer = nn.Sequential(
-            nn.Conv2d(input_dim, self.hidden_dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.Conv2d(input_dim, self.hidden_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(self.hidden_dim) if use_bn else nn.Identity(),
             # 활성화 함수(ReLU)는 선택사항이나, 단순 좌표 변환(Linear Transformation)이 
             # 목적이므로 여기서는 생략하여 정보 손실을 최소화함.
+            nn.ReLU()
         )
         
         # 초기화: Incremental Session 시작 시 Identity에 가깝게 시작하는 것이 유리함
