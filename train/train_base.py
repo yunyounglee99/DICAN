@@ -94,7 +94,7 @@ class BaseTrainer:
         # Seg Loss 가중치
         # 너무 크면 분류를 희생하고 세그에만 집중
         # 너무 작으면 Backbone이 위치를 못 배움
-        lambda_seg = 1.0
+        lambda_seg = 1e+4
         
         best_val_acc = 0.0
         
@@ -153,7 +153,7 @@ class BaseTrainer:
                 
                 loop.set_postfix({
                     "cls": f"{loss_cls.item():.3f}",
-                    "seg": f"{loss_seg.item():.3f}",
+                    "seg": f"{lambda_seg*loss_seg.item():.3f}",
                     "acc": f"{100.*correct/total:.1f}%"
                 })
             
@@ -355,14 +355,24 @@ class BaseTrainer:
             for batch_data in loop:
                 images = batch_data['image'].to(self.device)
                 labels = batch_data['label'].to(self.device)
+                masks = batch_data['masks'].to(self.device)
                 
                 optimizer.zero_grad()
                 
                 outputs = self.model(images)
                 logits = outputs['logits']
                 concept_scores = outputs['concept_scores']
+                seg_pred = outputs['seg_pred']
                 
                 loss_cls = F.cross_entropy(logits, labels, weight=class_weights)
+
+                has_lesion = (labels > 0)
+                if has_lesion.any():
+                    loss_seg = self._focal_bce_loss(
+                        seg_pred[has_lesion],
+                        masks[has_lesion],
+                        gamma=2.0, alpha=0.75
+                    )
                 
                 # Sparsity
                 loss_sp = torch.tensor(0.0, device=self.device)
