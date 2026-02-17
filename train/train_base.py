@@ -2,18 +2,10 @@
 DICAN Base Training - 3-Phase (Pixel-Level Seg Supervision)
 =============================================================
 Phase 1-A: Backbone + TempHead + SegDecoder 학습
-           - L_cls: 전체 샘플 → CE (등급 분류)
-           - L_seg: 마스크가 있는 샘플만 → Focal BCE (병변 위치)
-           ★ DDR 275개 + FGADR ~1565개 = ~1840개 마스크 샘플
-
 Phase 1-B: Backbone Freeze → Masked GAP → Prototype 추출
-
 Phase 1-C: Backbone + Prototype Freeze → CBM Head 학습
-           ★ seg_pred 관련 코드 완전 제거 (head_train 모드에서 None)
 
-[버그 수정 2건]
-1. Phase 1-A: labels > 0 → masks.sum() > 0 (실제 마스크 존재 여부로 필터링)
-2. Phase 1-C: seg_pred[has_lesion] → 삭제 (head_train 모드에서 seg_pred=None)
+★ QWK (Quadratic Weighted Kappa) 추가: 모든 validation에서 Acc와 함께 출력
 """
 
 import os
@@ -23,6 +15,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 import numpy as np
+from sklearn.metrics import cohen_kappa_score
+
+
+def quadratic_weighted_kappa(y_true, y_pred):
+    """QWK 계산 유틸리티"""
+    if len(y_true) == 0:
+        return 0.0
+    return cohen_kappa_score(y_true, y_pred, weights='quadratic')
 
 
 class BaseTrainer:
@@ -46,7 +46,6 @@ class BaseTrainer:
                 masks = batch['masks']
                 print(f"  Masks: {masks.shape}")
                 
-                # ★ 배치 내 마스크 존재 비율
                 has_any_mask = (masks.sum(dim=(1,2,3)) > 0).sum().item()
                 print(f"  Batch mask coverage: {has_any_mask}/{masks.size(0)} images "
                       f"({100*has_any_mask/masks.size(0):.0f}%)")
@@ -59,7 +58,6 @@ class BaseTrainer:
                     print(f"    {name}: {active_imgs}/{masks.size(0)} images, "
                           f"{active_pixels:,} pixels ({ratio:.2f}%)")
                 
-                # 마스크 값 검증
                 unique_vals = torch.unique(masks)
                 print(f"  Mask unique values: {unique_vals.tolist()}")
                 if 1.0 in unique_vals:
@@ -75,17 +73,6 @@ class BaseTrainer:
     # Phase 1-A: Backbone + Pixel-Level Segmentation
     # =================================================================
     def phase_1a_pretrain(self):
-        """
-        [핵심 수정: 마스크 가용성 기반 필터링]
-        
-        DDR + FGADR 합산 데이터:
-          - 전체: ~8677개 (DDR 6835 + FGADR ~1842)
-          - 마스크 있음: ~2117개 (DDR 275 + FGADR ~1842)
-          
-        필터링 기준:
-          ❌ labels > 0 (틀림: Grade 1~4여도 마스크 없는 이미지 대다수)
-          ✅ masks.sum() > 0 (올바름: 실제 마스크 파일이 로드된 샘플만)
-        """
         print(f"\n{'='*60}")
         print(f"  Phase 1-A: Backbone + Pixel-Level Seg (224×224)")
         print(f"{'='*60}")
@@ -105,11 +92,10 @@ class BaseTrainer:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         
         class_weights = torch.tensor([0.5, 2.0, 2.0, 3.0, 3.0], device=self.device)
-        
-        # Seg Loss 가중치 (FGADR 추가로 마스크 샘플 충분해짐 → 적절한 값)
         lambda_seg = 100.0
         
         best_val_acc = 0.0
+        best_val_kappa = 0.0
         total_masked_samples = 0
         
         for epoch in range(epochs):
@@ -137,12 +123,9 @@ class BaseTrainer:
                 cls_logits = outputs['logits']
                 seg_pred = outputs['seg_pred']
                 
-                # ─── Classification Loss (전체 샘플) ───
                 loss_cls = F.cross_entropy(cls_logits, labels, weight=class_weights)
                 
-                # ─── Seg Loss (마스크가 실제 존재하는 샘플만) ───
-                # ★★★ 핵심 수정: labels > 0 대신 masks.sum() > 0 ★★★
-                has_mask = (masks.sum(dim=(1, 2, 3)) > 0)  # [B] boolean
+                has_mask = (masks.sum(dim=(1, 2, 3)) > 0)
                 
                 if has_mask.any():
                     loss_seg = self._focal_bce_loss(
@@ -179,15 +162,18 @@ class BaseTrainer:
             train_acc = 100. * correct / total
             avg_seg = total_seg / len(self.train_loader)
             
-            val_acc = self._validate_pretrain(class_weights)
+            # ★ QWK 포함 Validation
+            val_acc, val_kappa = self._validate_pretrain(class_weights)
             
             print(f"  Epoch {epoch+1}: Train={train_acc:.1f}%, Val={val_acc:.1f}%, "
+                  f"QWK={val_kappa:.4f}, "
                   f"SegLoss={lambda_seg*avg_seg:.4f}, MaskedSamples={epoch_masked}")
             
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+                best_val_kappa = val_kappa
                 self.save_model("phase1a_best.pth")
-                print(f"  ★ Best: {val_acc:.2f}%")
+                print(f"  ★ Best: {val_acc:.2f}% (QWK={val_kappa:.4f})")
         
         self.load_model("phase1a_best.pth")
         
@@ -195,11 +181,10 @@ class BaseTrainer:
               f"(~{total_masked_samples//max(epochs,1)} per epoch)")
         self._verify_seg_quality_pixel_level()
         
-        print(f"\n[1-A] Complete. Best Val Acc: {best_val_acc:.2f}%")
+        print(f"\n[1-A] Complete. Best Val Acc: {best_val_acc:.2f}%, QWK: {best_val_kappa:.4f}")
         return best_val_acc
 
     def _focal_bce_loss(self, pred, target, gamma=2.0, alpha=0.75):
-        """Focal Loss for pixel-level binary segmentation"""
         bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
         p = torch.sigmoid(pred)
         pt = p * target + (1 - p) * (1 - target)
@@ -209,9 +194,13 @@ class BaseTrainer:
         return loss.mean()
 
     def _validate_pretrain(self, class_weights):
+        """★ Accuracy + QWK 동시 반환"""
         self.model.eval()
         correct = 0
         total = 0
+        all_preds = []
+        all_labels = []
+        
         with torch.no_grad():
             for batch_data in self.val_loader:
                 images = batch_data['image'].to(self.device)
@@ -220,7 +209,13 @@ class BaseTrainer:
                 _, predicted = outputs['logits'].max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
-        return 100. * correct / total
+                
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        
+        acc = 100. * correct / total
+        kappa = quadratic_weighted_kappa(all_labels, all_preds)
+        return acc, kappa
 
     def _verify_seg_quality_pixel_level(self):
         """224×224 해상도에서 Segmentation 품질 검증"""
@@ -239,7 +234,6 @@ class BaseTrainer:
                 images = batch_data['image'].to(self.device)
                 masks = batch_data['masks'].to(self.device).float()
                 
-                # ★ 마스크가 있는 배치만 Dice 계산
                 has_mask = (masks.sum(dim=(1, 2, 3)) > 0)
                 if not has_mask.any():
                     count += 1
@@ -309,16 +303,9 @@ class BaseTrainer:
         print(f"[1-B] Complete.")
 
     # =================================================================
-    # Phase 1-C: Head Training
-    # ★★★ seg_pred 관련 코드 완전 제거 ★★★
-    # head_train 모드에서 seg_pred=None이므로 접근하면 TypeError 발생
+    # Phase 1-C: Head Training (★ QWK 추가)
     # =================================================================
     def phase_1c_train_head(self):
-        """
-        CBM Head만 학습하는 Phase.
-        Backbone, Prototype 모두 Frozen.
-        seg_pred는 None이므로 절대 참조하지 않음.
-        """
         print(f"\n{'='*60}")
         print(f"  Phase 1-C: CBM Head Training")
         print(f"{'='*60}")
@@ -336,6 +323,7 @@ class BaseTrainer:
         class_weights = torch.tensor([0.5, 2.0, 2.0, 3.0, 3.0], device=self.device)
         
         best_val_acc = 0.0
+        best_val_kappa = 0.0
         
         for epoch in range(epochs):
             self.model.head.train()
@@ -354,17 +342,14 @@ class BaseTrainer:
                 logits = outputs['logits']
                 concept_scores = outputs['concept_scores']
                 
-                # ─── Classification Loss ───
                 loss_cls = F.cross_entropy(logits, labels, weight=class_weights)
                 
-                # ─── Sparsity: Grade 0은 concept 비활성화 ───
                 loss_sp = torch.tensor(0.0, device=self.device)
                 normal = (labels == 0)
                 if normal.any() and concept_scores is not None:
                     max_scores = concept_scores[normal, :self.model.num_concepts]
                     loss_sp = torch.relu(max_scores).mean()
                 
-                # ★ seg_pred 관련 코드 없음 (head_train에서 None이므로)
                 loss = loss_cls + 0.3 * loss_sp
                 loss.backward()
                 optimizer.step()
@@ -380,25 +365,33 @@ class BaseTrainer:
                 })
             
             scheduler.step()
-            val_acc = self._validate_head()
+            
+            # ★ QWK 포함 Validation
+            val_acc, val_kappa = self._validate_head()
             print(f"  Epoch {epoch+1}: Train={100.*correct/total:.1f}%, Val={val_acc:.1f}%, "
+                  f"QWK={val_kappa:.4f}, "
                   f"Scale={self.model.prototypes.logit_scale.exp().item():.1f}")
             
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+                best_val_kappa = val_kappa
                 self.save_model("phase1c_best.pth")
-                print(f"  ★ Best: {val_acc:.2f}%")
+                print(f"  ★ Best: {val_acc:.2f}% (QWK={val_kappa:.4f})")
         
         self.load_model("phase1c_best.pth")
         self._analyze_concept_scores()
         
-        print(f"\n[1-C] Complete. Best Val Acc: {best_val_acc:.2f}%")
+        print(f"\n[1-C] Complete. Best Val Acc: {best_val_acc:.2f}%, QWK: {best_val_kappa:.4f}")
         return best_val_acc
 
     def _validate_head(self):
+        """★ Accuracy + QWK 동시 반환"""
         self.model.eval()
         correct = 0
         total = 0
+        all_preds = []
+        all_labels = []
+        
         with torch.no_grad():
             for batch_data in self.val_loader:
                 images = batch_data['image'].to(self.device)
@@ -409,7 +402,13 @@ class BaseTrainer:
                 _, predicted = logits.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
-        return 100. * correct / total
+                
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        
+        acc = 100. * correct / total
+        kappa = quadratic_weighted_kappa(all_labels, all_preds)
+        return acc, kappa
 
     def _analyze_concept_scores(self):
         print("\n[*] Concept Score Analysis by DR Grade:")

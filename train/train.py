@@ -8,10 +8,7 @@ Usage:
       --batch_size 32 \
       --device cuda
 
-[변경사항]
-- data_path가 이제 DDR/FGADR 상위 폴더 (DICAN_DATASETS)를 가리킴
-- DDR + FGADR을 ConcatDataset으로 합쳐서 Phase 1-A/B/C에 사용
-- --fgadr_root 인자 추가 (별도 경로 지정 가능)
+★ QWK (Quadratic Weighted Kappa) 추가: 모든 평가 지점에서 출력
 """
 
 import argparse
@@ -44,7 +41,6 @@ def set_seed(seed):
 def get_args():
     parser = argparse.ArgumentParser(description="DICAN Training Pipeline")
     
-    # ★ data_path: DICAN_DATASETS 루트 (DDR, FGADR, aptos 등 상위 폴더)
     parser.add_argument('--data_path', type=str, required=True,
                         help='Root of all datasets (e.g., /root/DICAN_DATASETS)')
     parser.add_argument('--ddr_root', type=str, default=None,
@@ -78,7 +74,6 @@ def get_args():
     
     args = parser.parse_args()
     
-    # 기본 경로 설정
     if args.ddr_root is None:
         args.ddr_root = os.path.join(args.data_path, 'DDR')
     if args.fgadr_root is None:
@@ -127,31 +122,19 @@ class IncLoaderManager:
 
 
 def get_base_loaders(args):
-    """
-    ★ DDR + FGADR 합산 데이터 로더
-    
-    Before: DDR만 사용 → 6835 이미지, 275 마스크 (4%)
-    After:  DDR + FGADR → ~8677 이미지, ~2117 마스크 (24%)
-    
-    두 데이터셋의 __getitem__ 반환 포맷이 동일하므로
-    ConcatDataset으로 바로 합칠 수 있음.
-    """
     print(f"\n[*] Loading Base Data...")
     print(f"    DDR:   {args.ddr_root}")
     print(f"    FGADR: {args.fgadr_root}")
     
-    # ─── DDR ───
     ddr_train = DDRBaseDataset(root_dir=args.ddr_root, split='train')
     ddr_val = DDRBaseDataset(root_dir=args.ddr_root, split='valid')
     
-    # ─── FGADR ───
     use_fgadr = (not args.no_fgadr) and os.path.exists(args.fgadr_root)
     
     if use_fgadr:
         fgadr_train = FGADRSegDataset(root_dir=args.fgadr_root, split='train')
         fgadr_val = FGADRSegDataset(root_dir=args.fgadr_root, split='valid')
         
-        # ─── 합산 ───
         train_dataset = ConcatDataset([ddr_train, fgadr_train])
         val_dataset = ConcatDataset([ddr_val, fgadr_val])
         
@@ -200,32 +183,29 @@ def main():
     print(f"   - Hybrid Pooling: Max + Mean = {args.n_concepts * 2} dim")
     print("=" * 50 + "\n")
 
-    # 모델 초기화
     model = DICAN_CBM(
         num_concepts=args.n_concepts,
         num_classes=args.num_classes,
         feature_dim=2048
     ).to(device)
 
-    # Loader
     inc_loader_manager = IncLoaderManager(args)
     train_loader, val_loader = get_base_loaders(args)
     
-    # Evaluator
     evaluator = Evaluator(model, device, val_loader, inc_loader_manager, args)
 
     # -------------------------------------------------------
-    # [Phase 1] Base Training (3-Phase: Pretrain → Extract → Head)
+    # [Phase 1] Base Training
     # -------------------------------------------------------
     base_trainer = BaseTrainer(args, model, device, train_loader, val_loader)
     model = base_trainer.run()
     
-    # Base 평가
+    # ★ Base 평가 (QWK 포함)
     print("\n[Eval] Evaluation after Base Session...")
     model.set_session_mode('eval')
     evaluator.evaluate_all_tasks(current_session_id=0)
     metrics = evaluator.calculate_metrics(current_session_id=0)
-    print(f"   >>> Base Avg Acc: {metrics['avg_acc']:.2f}%")
+    print(f"   >>> Base Avg Acc: {metrics['avg_acc']:.2f}%, Avg QWK: {metrics['avg_kappa']:.4f}")
 
     # -------------------------------------------------------
     # [Phase 2] Incremental Learning
@@ -244,23 +224,27 @@ def main():
         evaluator.evaluate_all_tasks(current_session_id=task_id)
         metrics = evaluator.calculate_metrics(current_session_id=task_id)
         
+        # ★ QWK 포함 전체 Metric 출력
         print(f"\n📊 [Metrics - Task {task_id}]")
         print(f"   - Average Accuracy  : {metrics['avg_acc']:.2f}%")
-        print(f"   - Backward Transfer : {metrics['bwt']:.2f}%")
-        print(f"   - Forward Transfer  : {metrics['fwt']:.2f}%")
-        print(f"   - Forgetting        : {metrics['forgetting']:.2f}%")
+        print(f"   - Average QWK       : {metrics['avg_kappa']:.4f}")
+        print(f"   - Backward Transfer : {metrics['bwt']:.2f}%  (QWK: {metrics['bwt_kappa']:.4f})")
+        print(f"   - Forward Transfer  : {metrics['fwt']:.2f}%  (QWK: {metrics['fwt_kappa']:.4f})")
+        print(f"   - Forgetting        : {metrics['forgetting']:.2f}%  (QWK: {metrics['forgetting_kappa']:.4f})")
         print(f"   - Task Accuracies   : {metrics['raw_accs']}")
+        print(f"   - Task QWKs         : {metrics['raw_kappas']}")
         
         model.set_session_mode('incremental')
 
-    # 최종 결과
+    # ★ 최종 결과 (QWK 포함)
     print("\n" + "=" * 50)
     print("🎉 All Training Finished!")
     final = evaluator.calculate_metrics(current_session_id=args.n_tasks - 1)
-    print(f"   - Final Avg Acc : {final['avg_acc']:.2f}%")
-    print(f"   - Final BWT     : {final['bwt']:.2f}%")
-    print(f"   - Final FWT     : {final['fwt']:.2f}%")
-    print(f"   - Final Forget  : {final['forgetting']:.2f}%")
+    print(f"   - Final Avg Acc  : {final['avg_acc']:.2f}%")
+    print(f"   - Final Avg QWK  : {final['avg_kappa']:.4f}")
+    print(f"   - Final BWT      : {final['bwt']:.2f}%  (QWK: {final['bwt_kappa']:.4f})")
+    print(f"   - Final FWT      : {final['fwt']:.2f}%  (QWK: {final['fwt_kappa']:.4f})")
+    print(f"   - Final Forget   : {final['forgetting']:.2f}%  (QWK: {final['forgetting_kappa']:.4f})")
     print("=" * 50)
 
 

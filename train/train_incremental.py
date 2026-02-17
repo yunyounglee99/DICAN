@@ -2,8 +2,16 @@ import torch
 import torch.optim as optim
 from tqdm import tqdm
 import numpy as np
+from sklearn.metrics import cohen_kappa_score
 
 from utils.loss import DICANLoss
+
+
+def quadratic_weighted_kappa(y_true, y_pred):
+    """QWK 계산 유틸리티"""
+    if len(y_true) == 0:
+        return 0.0
+    return cohen_kappa_score(y_true, y_pred, weights='quadratic')
 
 
 class IncrementalTrainer:
@@ -41,10 +49,10 @@ class IncrementalTrainer:
         if self.args.adaptation_steps > 0:
             self.adapt_to_domain(support_loader, task_id)
         
-        # 2. Evaluation
-        acc = self.evaluate(query_loader, task_id)
+        # 2. Evaluation (★ QWK 포함)
+        acc, kappa = self.evaluate(query_loader, task_id)
         
-        print(f"{'='*20} Task {task_id} Done (Acc: {acc:.2f}%) {'='*20}\n")
+        print(f"{'='*20} Task {task_id} Done (Acc: {acc:.2f}%, QWK: {kappa:.4f}) {'='*20}\n")
         return acc
 
     def adapt_to_domain(self, support_loader, task_id):
@@ -53,7 +61,6 @@ class IncrementalTrainer:
         
         self.model.set_session_mode('incremental')
         
-        # Projector 파라미터만 학습
         trainable_params = self.model.get_trainable_params()
         if not trainable_params:
             print("[Warning] No trainable parameters found!")
@@ -93,10 +100,12 @@ class IncrementalTrainer:
                       f"ord={log_dict['loss_ordinal']:.3f})")
 
     def evaluate(self, query_loader, task_id):
-        """Query Set 평가"""
+        """★ Query Set 평가 (Accuracy + QWK)"""
         self.model.set_session_mode('eval')
         correct = 0
         total = 0
+        all_preds = []
+        all_labels = []
         
         with torch.no_grad():
             for batch_data in tqdm(query_loader, desc=f"Eval Task {task_id}"):
@@ -109,8 +118,15 @@ class IncrementalTrainer:
                 _, predicted = logits.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
+                
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
         
-        return 100. * correct / total if total > 0 else 0.0
+        acc = 100. * correct / total if total > 0 else 0.0
+        kappa = quadratic_weighted_kappa(all_labels, all_preds)
+        
+        print(f"  Task {task_id}: Acc={acc:.2f}%, QWK={kappa:.4f}")
+        return acc, kappa
 
     def _print_stats(self, task_id, support_loader, query_loader):
         print(f"\n  Task {task_id} Data:")
