@@ -59,7 +59,7 @@ class IncrementalTrainer:
         self._print_stats(task_id, support_loader, query_loader)
         
         # ★ Projector를 identity 근처로 re-initialize
-        self._reset_projector_near_identity()
+        # self._reset_projector_near_identity()
         
         # Adaptation
         if self.args.adaptation_steps > 0:
