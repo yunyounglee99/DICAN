@@ -3,95 +3,112 @@ import torch.nn as nn
 from torchvision import models
 from torchvision.models import ResNet50_Weights
 
+
 class ResNetBackbone(nn.Module):
     """
-    DICAN 모델을 위한 ResNet-50 Backbone.
+    DICAN Backbone - Multi-Scale Feature Extraction 지원
     
-    [핵심 역할]
-    1. Base Session: 이미지의 공간적 특징(Spatial Features)을 추출하여 
-      Masked Global Average Pooling(Masked GAP)이 가능하도록 함.
-    2. Incremental Session: 파라미터를 Freeze하여 Catastrophic Forgetting을 방지함.
+    [변경사항]
+    기존: nn.Sequential로 묶어서 최종 7×7만 출력
+    변경: ResNet의 4개 Stage를 분리하여 중간 feature도 반환 가능
+    
+    [ResNet-50 Feature Map 해상도]
+    stem (conv1+bn+pool): 224 → 56×56
+    layer1:               56  → 56×56,  256 channels
+    layer2:               56  → 28×28,  512 channels
+    layer3:               28  → 14×14, 1024 channels
+    layer4:               14  →  7×7,  2048 channels
+    
+    Pixel-level Segmentation을 위해 layer1~4의 feature를 모두 반환하여
+    Decoder가 skip connection으로 224×224까지 복원할 수 있게 함.
     """
 
-    def __init__(self, pretrained=True, freeze_bn=True):
-        """
-        Args:
-            pretrained (bool): ImageNet Pre-trained 가중치 사용 여부 (Default: True)
-            freeze_bn (bool): Base Session 학습 시에도 Batch Norm 통계량을 고정할지 여부.
-                              Few-shot이나 작은 배치에서는 True로 두는 것이 안정적일 수 있음.
-        """
+    def __init__(self, pretrained=True):
         super(ResNetBackbone, self).__init__()
 
-        # 1. ResNet-50 로드
         weights = ResNet50_Weights.DEFAULT if pretrained else None
-        original_model = models.resnet50(weights=weights)
+        resnet = models.resnet50(weights=weights)
 
-        # 2. Layer 분리 및 재조립
-        # 마지막 FC Layer(classification)와 AvgPool Layer를 제거합니다.
-        # 이유: 우리는 단순 분류가 아니라, 7x7 또는 14x14 크기의 
-        # Feature Map(공간 정보)이 필요하기 때문입니다 (for Masked GAP).
-        self.features = nn.Sequential(*list(original_model.children())[:-2])
+        # Stem: conv1 → bn1 → relu → maxpool (224 → 56)
+        self.stem = nn.Sequential(
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool
+        )
+        
+        # 4개 Residual Stage 분리
+        self.layer1 = resnet.layer1   # 56→56,   256ch
+        self.layer2 = resnet.layer2   # 56→28,   512ch
+        self.layer3 = resnet.layer3   # 28→14,  1024ch
+        self.layer4 = resnet.layer4   # 14→7,   2048ch
 
-        # 3. Feature Dimension 정보 저장 (Projector 등에서 사용)
-        self.output_dim = 2048  # ResNet-50의 마지막 채널 수
+        self.output_dim = 2048
 
-    def forward(self, x):
+    def forward(self, x, return_multi_scale=False):
         """
         Args:
-            x (Tensor): Input Image [Batch, 3, H, W]
+            x: [B, 3, 224, 224]
+            return_multi_scale: True면 중간 feature도 함께 반환 (SegDecoder용)
+        
         Returns:
-            x (Tensor): Feature Map [Batch, 2048, H/32, W/32]
-                        (예: 224x224 입력 시 -> 2048x7x7 출력)
+            return_multi_scale=False:
+                features: [B, 2048, 7, 7] (기존과 동일)
+            
+            return_multi_scale=True:
+                features: [B, 2048, 7, 7]
+                multi_scale: dict {
+                    'layer1': [B,  256, 56, 56],
+                    'layer2': [B,  512, 28, 28],
+                    'layer3': [B, 1024, 14, 14],
+                    'layer4': [B, 2048,  7,  7]
+                }
         """
-        x = self.features(x)
-        return x
+        x0 = self.stem(x)      # [B, 64, 56, 56]
+        x1 = self.layer1(x0)   # [B, 256, 56, 56]
+        x2 = self.layer2(x1)   # [B, 512, 28, 28]
+        x3 = self.layer3(x2)   # [B, 1024, 14, 14]
+        x4 = self.layer4(x3)   # [B, 2048, 7, 7]
+
+        if return_multi_scale:
+            return x4, {
+                'layer1': x1,
+                'layer2': x2,
+                'layer3': x3,
+                'layer4': x4
+            }
+        
+        return x4
 
     def set_session_mode(self, mode):
-        """
-        학습 단계(Session)에 따라 Backbone의 상태(Frozen/Trainable)를 전환하는 핵심 함수.
-        
-        Args:
-            mode (str): 'base' 또는 'incremental'
-        """
         if mode == 'base':
-            # Base Session: Backbone 학습 가능 (Fine-tuning)
-            # 단, 초기 레이어(Stem 등)는 고정하고 후반부만 푸는 전략도 가능함.
-            # 여기서는 전체 Fine-tuning을 기본으로 하되, BN은 선택적으로 제어.
             for param in self.parameters():
                 param.requires_grad = True
-            self.train() 
-            
+            self.train()
         elif mode == 'incremental':
-            # Incremental Session: Backbone 완전 고정 (Freeze)
-            # Replay-Free 환경에서 이전 지식을 잊지 않기 위함.
             for param in self.parameters():
                 param.requires_grad = False
-            
-            # 중요: Eval 모드로 전환하여 Batch Norm 통계량(Running Mean/Var)도 고정해야 함.
-            # 이를 안 하면 Few-shot 데이터의 통계량이 전체 분포를 망가뜨림.
             self.eval()
-            
         else:
-            raise ValueError(f"Unknown mode: {mode}. Use 'base' or 'incremental'.")
+            raise ValueError(f"Unknown mode: {mode}")
 
     def get_feature_dim(self):
-        """다른 모듈(Projector)에서 입력 차원을 알 수 있게 함"""
         return self.output_dim
 
-# --- 테스트 코드 (구현 시 확인용) ---
+
 if __name__ == "__main__":
-    # 모델 초기화
     backbone = ResNetBackbone(pretrained=True)
+    dummy = torch.randn(2, 3, 224, 224)
     
-    # 1. Base Session 모드 테스트
-    backbone.set_session_mode('base')
-    dummy_input = torch.randn(2, 3, 224, 224)
-    features = backbone(dummy_input)
-    print(f"[Base Mode] Output Shape: {features.shape}") 
-    # 예상: torch.Size([2, 2048, 7, 7]) -> Masked GAP에 적합한 형태
+    # 기존 호환 모드
+    feat = backbone(dummy)
+    print(f"[Standard] Output: {feat.shape}")  # [2, 2048, 7, 7]
     
-    # 2. Incremental Session 모드 테스트
-    backbone.set_session_mode('incremental')
-    # 파라미터가 고정되었는지 확인
-    print(f"[Inc Mode] Parameter requires_grad: {list(backbone.parameters())[0].requires_grad}")
-    # 예상: False
+    # Multi-scale 모드
+    feat, ms = backbone(dummy, return_multi_scale=True)
+    for name, tensor in ms.items():
+        print(f"[MultiScale] {name}: {tensor.shape}")
+    # layer1: [2, 256, 56, 56]
+    # layer2: [2, 512, 28, 28]
+    # layer3: [2, 1024, 14, 14]
+    # layer4: [2, 2048, 7, 7]

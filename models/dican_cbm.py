@@ -6,25 +6,34 @@ from .backbone import ResNetBackbone
 from .projector import ConceptProjector
 from .prototypes import PrototypeBank
 from .head import OrdinalRegressionHead
+from .seg_decoder import SegDecoder
 
 
 class DICAN_CBM(nn.Module):
     """
-    DICAN - Phase 분리 + Segmentation Supervision 버전
+    DICAN - Pixel-Level Segmentation Supervision 버전
     
-    [핵심 설계]
-    Phase 1-A에서 Backbone이 두 가지를 동시에 학습:
-      (a) Classification: "이 이미지의 DR 등급은 무엇인가?" (GAP → TempHead)
-      (b) Segmentation:   "병변이 7×7 어디에 있는가?"      (SegHead → BCE with mask)
+    [핵심 변경: SegHead → SegDecoder]
     
-    → Backbone이 "병변 위치 인식(Spatial Awareness)"을 학습한 상태에서 고정됨
-    → Phase 1-B에서 Masked GAP로 추출하는 prototype의 품질이 극적으로 향상됨
+    Before: Backbone [2048,7,7] → Conv1x1 → [4,7,7] (32×32 영역 단위)
+            → 마스크를 7×7로 줄여서 비교 → 디테일 소실
     
-    [Phase 구조]
-    Phase 1-A (pretrain):  Backbone + TempHead + SegHead 학습
-    Phase 1-B (extract):   Backbone Freeze → Masked Pooling → Prototype 구축
-    Phase 1-C (head_train): Backbone + Prototype Freeze → CBM Head 학습
-    Phase 2   (incremental): Projector만 학습
+    After:  Backbone multi-scale features
+              layer1 [256, 56,56] ─┐
+              layer2 [512, 28,28] ─┤  skip connections
+              layer3 [1024,14,14] ─┤
+              layer4 [2048, 7, 7] ─┘
+            → SegDecoder (U-Net 스타일) → [4, 224, 224]
+            → 원본 해상도 마스크와 직접 비교 → pixel-level 학습
+    
+    MA(미세동맥류)처럼 수 픽셀짜리 병변도
+    224×224에서는 존재가 명확하게 드러남.
+    
+    [Phase 구조 - 동일]
+    1-A: Backbone + TempHead + SegDecoder 학습 (★ pixel-level seg)
+    1-B: Backbone Freeze → Masked GAP → Prototype
+    1-C: Head 학습
+    2:   Projector 학습
     """
     
     def __init__(self, num_concepts=4, num_classes=5, feature_dim=2048):
@@ -34,10 +43,10 @@ class DICAN_CBM(nn.Module):
         self.feature_dim = feature_dim
         self.mode = 'pretrain'
 
-        # 1. Backbone (ResNet-50)
+        # 1. Backbone (Multi-Scale 지원)
         self.backbone = ResNetBackbone(pretrained=True)
         
-        # 2. Concept Projector (Phase 2용)
+        # 2. Projector (Phase 2)
         self.projector = ConceptProjector(input_dim=feature_dim)
         
         # 3. Prototype Bank (Hybrid Pooling)
@@ -46,14 +55,14 @@ class DICAN_CBM(nn.Module):
             feature_dim=feature_dim
         )
         
-        # 4. CBM Reasoning Head (Phase 1-C, Phase 2)
+        # 4. CBM Head (Phase 1-C, Phase 2)
         score_dim = self.prototypes.get_score_dim()
         self.head = OrdinalRegressionHead(
             input_dim=score_dim, 
             num_classes=num_classes
         )
         
-        # 5. Temporary Classification Head (Phase 1-A, 이후 폐기)
+        # 5. Temp Classification Head (Phase 1-A, 이후 폐기)
         self.temp_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -65,57 +74,56 @@ class DICAN_CBM(nn.Module):
         )
         
         # =============================================
-        # 6. Segmentation Head (Phase 1-A) [★ 핵심]
+        # 6. Pixel-Level Segmentation Decoder [★ 핵심]
         #
-        #    Backbone [B, 2048, 7, 7] → SegHead → [B, 4, 7, 7]
-        #    각 Concept(EX, HE, MA, SE)별 공간 활성화 맵 예측
+        #    7×7 SegHead 대신 U-Net 스타일 Decoder 사용
+        #    Backbone의 layer1~4 skip connection으로
+        #    224×224까지 복원하여 pixel 단위로 병변 학습
         #
-        #    이것이 Backbone에게 가르치는 것:
-        #    "이 7×7 좌표에 출혈이 있다/없다"
-        #    "이 7×7 좌표에 삼출물이 있다/없다"
-        #
-        #    → feature map의 각 픽셀이 병변 유무를 인코딩하게 됨
-        #    → Phase 1-B의 Masked GAP에서 추출되는 벡터가
-        #      "진짜 병변 특징"을 담게 됨
+        #    이 Decoder의 gradient가 Backbone 전체를 관통하여
+        #    "layer1의 56×56에서도 병변 경계를 인식"하게 만듦
         # =============================================
-        self.seg_head = nn.Sequential(
-            nn.Conv2d(feature_dim, 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, num_concepts, kernel_size=1, bias=True)
-        )
+        self.seg_decoder = SegDecoder(num_concepts=num_concepts)
         
-        self._init_auxiliary_heads()
+        self._init_temp_head()
 
-    def _init_auxiliary_heads(self):
-        for module in [self.temp_head, self.seg_head]:
-            for m in module.modules():
-                if isinstance(m, (nn.Linear, nn.Conv2d)):
-                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
-                elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-                    nn.init.constant_(m.weight, 1)
+    def _init_temp_head(self):
+        for m in self.temp_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x, masks=None):
         
         # ===========================================================
-        # Phase 1-A: Pretrain
-        #   Backbone → feature [B,2048,7,7]
-        #              ├→ GAP → TempHead → cls_logits    (등급 분류)
-        #              └→ SegHead → seg_pred [B,4,7,7]   (병변 위치)
+        # Phase 1-A: Pretrain (Classification + Pixel-Level Segmentation)
+        #
+        # Backbone에서 multi-scale feature를 뽑고:
+        #   (a) layer4 → GAP → TempHead → 등급 분류
+        #   (b) layer1~4 → SegDecoder → [B,4,224,224] pixel 예측
+        #
+        # Decoder의 gradient가 layer1~4 모두를 통과하므로
+        # Backbone의 모든 레벨에서 병변 인식 능력이 형성됨
         # ===========================================================
         if self.mode == 'pretrain':
-            raw_features = self.backbone(x)
-            cls_logits = self.temp_head(raw_features)
-            seg_pred = self.seg_head(raw_features)
+            # Multi-scale feature 추출
+            feat4, multi_scale = self.backbone(x, return_multi_scale=True)
+            
+            # (a) Classification
+            cls_logits = self.temp_head(feat4)  # [B, 5]
+            
+            # (b) Pixel-level Segmentation
+            seg_pred = self.seg_decoder(multi_scale)  # [B, 4, 224, 224] ★
             
             return {
                 "logits": cls_logits,
-                "seg_pred": seg_pred,
+                "seg_pred": seg_pred,  # 224×224 pixel-level
                 "concept_scores": None,
-                "features": raw_features,
+                "features": feat4,
                 "spatial_sim_map": None
             }
         
@@ -186,13 +194,15 @@ class DICAN_CBM(nn.Module):
         self.mode = mode
         
         if mode == 'pretrain':
+            # Backbone + TempHead + SegDecoder 학습
             self.backbone.set_session_mode('base')
             for p in self.temp_head.parameters():
                 p.requires_grad = True
             self.temp_head.train()
-            for p in self.seg_head.parameters():
+            for p in self.seg_decoder.parameters():
                 p.requires_grad = True
-            self.seg_head.train()
+            self.seg_decoder.train()
+            # 나머지 Freeze
             for p in self.projector.parameters():
                 p.requires_grad = False
             self.projector.eval()
@@ -200,10 +210,10 @@ class DICAN_CBM(nn.Module):
                 p.requires_grad = False
             self.head.eval()
             
-            print("   → Backbone: Trainable")
-            print("   → TempHead: Trainable (Classification)")
-            print("   → SegHead:  Trainable (Lesion Localization)")
-            print("   → Projector/CBM Head/Prototypes: Frozen")
+            print("   → Backbone:    Trainable")
+            print("   → TempHead:    Trainable (Classification)")
+            print("   → SegDecoder:  Trainable (224×224 Pixel-Level Seg)") 
+            print("   → Projector/CBM Head: Frozen")
             
         elif mode == 'extract':
             self.backbone.set_session_mode('incremental')
@@ -219,16 +229,16 @@ class DICAN_CBM(nn.Module):
                 p.requires_grad = True
             self.head.train()
             self.prototypes.logit_scale.requires_grad = True
-            for p in self.seg_head.parameters():
+            for p in self.seg_decoder.parameters():
                 p.requires_grad = False
-            self.seg_head.eval()
+            self.seg_decoder.eval()
             for p in self.temp_head.parameters():
                 p.requires_grad = False
             self.temp_head.eval()
             
-            print("   → Backbone: Frozen (lesion-aware features locked)")
-            print("   → Prototypes: Fixed (logit_scale trainable)")
-            print("   → CBM Head: Trainable")
+            print("   → Backbone:  Frozen (lesion-aware)")
+            print("   → CBM Head:  Trainable")
+            print("   → logit_scale: Trainable")
             
         elif mode == 'incremental':
             self.backbone.set_session_mode('incremental')
@@ -238,7 +248,7 @@ class DICAN_CBM(nn.Module):
             self.head.eval()
             self.prototypes.logit_scale.requires_grad = False
             print("   → Projector: Trainable")
-            print("   → Backbone + Head + Prototypes: Frozen")
+            print("   → All else:  Frozen")
             
         elif mode == 'eval':
             self.eval()
@@ -249,7 +259,7 @@ class DICAN_CBM(nn.Module):
         if self.mode == 'pretrain':
             params = (list(self.backbone.parameters()) + 
                      list(self.temp_head.parameters()) + 
-                     list(self.seg_head.parameters()))
+                     list(self.seg_decoder.parameters()))
         elif self.mode == 'head_train':
             params = list(self.head.parameters()) + [self.prototypes.logit_scale]
         elif self.mode == 'incremental':
