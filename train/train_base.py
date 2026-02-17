@@ -171,38 +171,27 @@ class BaseTrainer:
 
     def extract_and_save_prototypes(self):
         """
-        Base 학습 완료 후, Prototype 추출
-        (use_projector=False로 추출해야 Backbone의 순수 Feature가 저장됨)
+        [Fix] 학습이 완료된 후, 모델 내부의 프로토타입 값을 파일로 저장합니다.
+        (학습 중에 이미 update_with_masks를 통해 프로토타입이 완성되었으므로, 다시 추출할 필요 없음)
         """
-        print("\n[*] Extracting Base Prototypes (Backbone Features)...")
-        self.model.eval()
+        print(f"\n[*] Saving Base Prototypes...")
         
-        all_concepts = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for batch_data in tqdm(self.train_loader, desc="Extracting Features"):
-                # [핵심 수정] 딕셔너리 접근
-                images = batch_data['image'].to(self.device)
-                labels = batch_data['label'].to(self.device)
-                
-                # Base Session에서는 Mask를 활용해 Prototype 업데이트
-                if 'masks' in batch_data:
-                    masks = batch_data['masks'].to(self.device).float()
-                else:
-                    continue # 마스크 없으면 스킵
-                
-                # Projector 없이 Feature 추출
-                _, features = self.model(images, use_projector=False)
-                
-                # 배치 단위로 프로토타입 업데이트 (PrototypeBank 내부에서 처리)
-                self.proto_bank.update_with_masks(features, masks)
-        
-        # 모델에 프로토타입 주입
-        if hasattr(self.model, 'prototypes'):
-            self.model.prototypes = self.proto_bank.prototypes.clone()
+        # 저장 경로 설정 (args.save_path가 없다면 기본값 사용)
+        save_dir = getattr(self.args, 'save_path', './checkpoints')
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
             
-        print(f"[*] Base Prototypes Updated via Masked Averaging.")
+        save_path = os.path.join(save_dir, "base_prototypes.pt")
+        
+        # 모델의 프로토타입 뱅크에 있는 값을 저장
+        # (DICAN_CBM -> PrototypeBank -> prototypes 버퍼)
+        if hasattr(self.model, 'prototypes'):
+            # self.model.prototypes는 PrototypeBank 모듈임
+            # 실제 텐서는 self.model.prototypes.prototypes에 있음
+            torch.save(self.model.prototypes.prototypes.cpu(), save_path)
+            print(f"[*] Base Prototypes saved to {save_path}")
+        else:
+            print("[Warning] Model does not have 'prototypes' attribute. Skipping save.")
 
     def run(self):
         print(f"\n{'='*20} [Phase 1] Base Training Start (Projector OFF) {'='*20}")

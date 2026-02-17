@@ -35,27 +35,35 @@ class PrototypeBank(nn.Module):
 
     def forward(self, features):
         """
-        [Incremental Session용]
-        입력 특징과 프로토타입 간의 유사도(Concept Score) 계산
-        
+        [Spatial Concept Matching Strategy]
         Args:
-            features: [Batch, 2048, 7, 7] (Projector를 통과한 특징)
+            features: [Batch, 2048, 7, 7]
         Returns:
-            similarity: [Batch, num_concepts] (0~1 사이 값)
+            concept_scores: [Batch, num_concepts] (최종 점수)
+            spatial_sim_map: [Batch, num_concepts, 7, 7] (시각화 및 Loss용)
         """
-        # 1. Spatial Pooling (공간 차원 압축)
-        # Projector를 통과한 특징은 위치 정보가 정렬되었으므로 GAP 수행
-        z = F.adaptive_avg_pool2d(features, (1, 1)).view(features.size(0), -1) # [Batch, 2048]
+        batch, ch, h, w = features.shape
         
-        # 2. 정규화 (Cosine Similarity를 위해)
-        z_norm = F.normalize(z, p=2, dim=1)
-        p_norm = F.normalize(self.prototypes, p=2, dim=1)
+        # 1. Feature 정규화 (채널 기준)
+        z = F.normalize(features, p=2, dim=1) # [B, 2048, 7, 7]
         
-        # 3. 유사도 계산 (Dot Product)
-        # [Batch, 2048] @ [2048, 4] -> [Batch, 4]
-        similarity = torch.mm(z_norm, p_norm.t())
+        # 2. Prototype 정규화
+        p = F.normalize(self.prototypes, p=2, dim=1) # [K, 2048]
         
-        return similarity * self.scale_factor
+        # 3. 픽셀별 유사도 계산 (1x1 Conv 처럼 동작)
+        # [B, C, H, W] * [K, C] -> [B, K, H, W]
+        spatial_sim_map = torch.einsum('bchw,kc->bkhw', z, p)
+        
+        # 4. [Scale Factor 적용] 신호 증폭 (필수!)
+        # -1~1 사이 값을 -10~10으로 뻥튀기해야 Head가 학습됨
+        spatial_sim_map = spatial_sim_map * self.scale_factor # scale_factor=20.0 추천
+
+        # 5. Spatial Aggregation (Pixel -> Image Level Score)
+        # "어디선가 병변이 강하게 떴다면 그것은 병변이다" -> Max Pooling
+        # [B, K, 7, 7] -> [B, K]
+        concept_scores = F.max_pool2d(spatial_sim_map, kernel_size=(h, w)).view(batch, -1)
+        
+        return concept_scores, spatial_sim_map
     
     def compute_spatial_similarity(self, features):
         """
@@ -77,66 +85,59 @@ class PrototypeBank(nn.Module):
 
     def update_with_masks(self, features, masks, update_prototype=True):
         """
-        Args:
-            update_prototype (bool): True면 EMA로 프로토타입 갱신 (Train용), 
-                                     False면 값만 계산 (Val용) - [Fix]
+        [Spatial Concept 전략 적용]
+        1. 프로토타입 업데이트: 'Masked Average' (안정적인 기준점 생성)
+        2. 점수 반환: 'Spatial Max' (Incremental Session과 동일한 로직으로 Head 학습)
         """
+        # features: [B, 2048, 7, 7]
         batch_size = features.size(0)
         feat_h, feat_w = features.shape[2], features.shape[3]
         
+        # 마스크 리사이징 (224 -> 7)
         masks_resized = F.interpolate(masks, size=(feat_h, feat_w), mode='nearest')
         
-        current_batch_concepts = [] # Head 학습용 (Batch, Total_Protos)
-
-        for k in range(self.num_concepts):
-            # 1. 마스크로 정답 특징 추출 (Masked GAP)
-            mask_k = masks_resized[:, k:k+1, :, :] 
-            mask_sum = mask_k.sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
-            masked_feat = (features * mask_k).sum(dim=(2, 3), keepdim=True) / mask_sum
-            masked_feat = masked_feat.view(batch_size, -1) # [B, 2048]
-            
-            # 2. 프로토타입 업데이트 (Base Session)
-            if update_prototype:
+        # ----------------------------------------------------------------------
+        # 1. 프로토타입 업데이트 (Reference Update)
+        #    - 방식: Masked Average (병변 영역의 중심점을 찾음)
+        #    - 이유: 프로토타입은 노이즈 없이 깨끗해야 하므로 평균을 씁니다.
+        # ----------------------------------------------------------------------
+        if update_prototype:
+            for k in range(self.num_concepts):
+                mask_k = masks_resized[:, k:k+1, :, :] 
+                mask_sum = mask_k.sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+                
+                # Masked Average Feature 계산
+                masked_feat = (features * mask_k).sum(dim=(2, 3), keepdim=True) / mask_sum
+                
+                # 유효한 샘플(병변이 있는 경우)만 골라서 EMA 업데이트
                 valid_indices = (mask_k.view(batch_size, -1).sum(dim=1) > 0)
                 if valid_indices.any():
-                    valid_feats = masked_feat[valid_indices].detach()
-                    new_proto_center = valid_feats.mean(dim=0) # [2048]
-
-                    # [Novelty Logic]
-                    # Base Session에서는 "정답"이 하나이므로, 
-                    # k번째 Concept에 속하는 '모든 서브 프로토타입(M개)'을 
-                    # 동일한 new_proto_center로 초기화/업데이트 함.
-                    # 나중에 Inc Session에서 Projector가 이들을 다르게 활용하게 됨.
-                    start_idx = k * self.num_sub_concepts
-                    end_idx = (k + 1) * self.num_sub_concepts
+                    # .detach() 필수! (Backbone 학습에 영향을 주지 않기 위해)
+                    valid_feats = masked_feat[valid_indices].view(-1, self.feature_dim).detach() 
+                    new_proto = valid_feats.mean(dim=0)
                     
-                    for sub_idx in range(start_idx, end_idx):
-                        if self.initialized[0]:
-                            self.prototypes[sub_idx] = self.momentum * self.prototypes[sub_idx] + \
-                                                       (1 - self.momentum) * new_proto_center
-                        else:
-                            self.prototypes[sub_idx] = new_proto_center
+                    # 프로토타입 정규화 (방향성 유지)
+                    new_proto = F.normalize(new_proto, p=2, dim=0)
 
-            # Head 학습을 위한 Score 준비 
-            # (현재 배치의 masked_feat와 저장된 모든 서브 프로토타입 간의 유사도)
-            # 여기서는 근사를 위해, 방금 추출한 masked_feat를 M번 복제해서 사용
-            for _ in range(self.num_sub_concepts):
-                current_batch_concepts.append(masked_feat)
-
-        if update_prototype:
+                    if self.initialized[0]:
+                        self.prototypes[k] = self.momentum * self.prototypes[k] + \
+                                             (1 - self.momentum) * new_proto
+                    else:
+                        self.prototypes[k] = new_proto
+            
             self.initialized.fill_(True)
 
-        # Head 학습용 점수 계산
-        # batch_concepts: [B, 20, 2048]
-        batch_concepts = torch.stack(current_batch_concepts, dim=1)
+        # ----------------------------------------------------------------------
+        # 2. [핵심 변경] Head 학습용 점수 반환 (Training-Inference Alignment)
+        #    - 기존: 평균 벡터끼리 유사도 계산 -> (X) Inc 모드와 로직 다름
+        #    - 변경: forward() 함수 호출 -> (O) Spatial Max & Scaling 적용됨
+        # ----------------------------------------------------------------------
+        # forward 내부 동작: Spatial Similarity Map 생성 -> Scale(x20) -> Max Pooling
+        # 결과: Head는 "가장 강한 병변 신호"를 보고 학습하게 됨 (Incremental 때와 동일)
         
-        z_norm = F.normalize(batch_concepts, p=2, dim=2)
-        p_norm = F.normalize(self.prototypes, p=2, dim=1) # [20, 2048]
+        concept_scores, _ = self.forward(features)
         
-        # Diagonal Similarity: [B, 20]
-        concept_scores = torch.einsum('bkd,kd->bk', z_norm, p_norm)
-        
-        return concept_scores * self.scale_factor
+        return concept_scores
 
     def save_prototypes(self, path):
         torch.save(self.prototypes.cpu(), path)

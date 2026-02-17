@@ -18,7 +18,7 @@ class DICAN_CBM(nn.Module):
       상이한 동작 방식(Logic)을 하나의 모델 안에서 스위칭함.
     """
     
-    def __init__(self, num_concepts=4, num_classes=5, feature_dim=2048, num_sub_concepts=5):
+    def __init__(self, num_concepts=4, num_classes=5, feature_dim=2048, num_sub_concepts=50):
         super(DICAN_CBM, self).__init__()
         self.mode = 'base' # 기본 모드 설정
 

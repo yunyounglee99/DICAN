@@ -96,52 +96,56 @@ class DICANLoss(nn.Module):
     # 2. Incremental Session Loss Logic (The Core of DICAN)
     # =========================================================================
     def _forward_incremental(self, outputs, targets):
-        labels = targets['label']         # [B]
-        logits = outputs['logits']        # [B, 5]
-        concept_scores = outputs['concept_scores'] # [B, 4] (Cosine Sim)
+        labels = targets['label']
+        logits = outputs['logits']
         
-        # 1. Alignment Loss (Max Pooling for Sub-concepts)
-        # [B, 20] -> [B, 4, 5] -> [B, 4] (각 컨셉별 최댓값 추출)
-        batch_size = concept_scores.size(0)
-        scores_reshaped = concept_scores.view(batch_size, self.num_concepts, -1) # -1 is num_sub_concepts
+        # [Fix] 기존 concept_scores 대신 공간 맵(Spatial Map)을 사용합니다.
+        # Shape: [Batch, 4, 7, 7] (4는 Concept 개수)
+        # dican_cbm.py의 forward에서 이 값을 리턴하도록 수정했는지 꼭 확인하세요.
+        spatial_sim_map = outputs['spatial_sim_map'] 
         
-        # Max Pooling: 서브 컨셉 중 가장 유사한 것 하나를 대표값으로 사용
-        concept_max_scores, _ = torch.max(scores_reshaped, dim=2) 
+        # ---------------------------------------------------------
+        # 1. Alignment Loss (Spatial Max Pooling)
+        # ---------------------------------------------------------
+        # "이미지 49개 구역(7x7) 중, 단 한 곳이라도 병변 특징이 강하면 '있다'고 판단한다"
+        # [B, 4, 7, 7] -> Flatten [B, 4, 49] -> Max [B, 4]
+        concept_max_scores, _ = spatial_sim_map.flatten(2).max(dim=2)
         
-        # Sigmoid로 0~1 변환
+        # Sigmoid로 확률 변환 (0~1)
+        # (PrototypeBank에서 이미 Scale Factor가 곱해져서 넘어옴)
         concept_probs = torch.sigmoid(concept_max_scores)
         
+        # 정답지 (Grade별 규칙) 가져오기
         expected_concepts = self.concept_rule_matrix[labels] # [B, 4]
+        
+        # BCE Loss 계산
         loss_align = F.binary_cross_entropy(concept_probs, expected_concepts)
 
-        # 2. Ordinal Loss (Class Weight 적용 추천!)
-        # 여기는 Head가 20개 입력을 다 받아서 처리했으므로 logits 그대로 사용
-        class_weights = torch.tensor([0.5, 2.0, 2.0, 3.0, 3.0], device=logits.device)
-        ce_loss = F.cross_entropy(logits, labels, weight=class_weights, reduction='none')
+        # ---------------------------------------------------------
+        # 2. Ordinal Regression Loss (Class Weight 적용)
+        # ---------------------------------------------------------
+        # 데이터 불균형 해결을 위한 가중치 (Grade 0은 적게, 나머지는 크게)
         
-        # 예측된 클래스 (argmax)
+        ce_loss = F.cross_entropy(logits, labels, reduction='none')
+        
         pred_labels = torch.argmax(logits, dim=1)
-        
-        # Penalty Weight 계산:
-        # 실제(Label)보다 예측(Pred)이 낮으면(Under-diagnosis) 페널티 부여
-        # 예: 실제 3, 예측 0 -> 차이 3 -> 가중치 크게
+        # 미진단(Under-diagnosis)에만 페널티 부여
         distance = labels - pred_labels
-        # distance > 0 인 경우(미진단)에만 가중치 적용 (예: 1 + 차이)
         penalty_weights = 1.0 + torch.relu(distance.float()) * 0.5 
         
         loss_ordinal = (ce_loss * penalty_weights).mean()
         
         # ---------------------------------------------------------
-        # Loss 3: Sparsity Constraint (For Normal Images)
+        # 3. Sparsity Constraint (정상 이미지 억제)
         # ---------------------------------------------------------
-        # 라벨이 0(Normal)인 샘플만 골라냄
         normal_indices = (labels == 0)
         loss_sparsity = torch.tensor(0.0, device=logits.device)
         
         if normal_indices.any():
-            # 정상 이미지의 모든 Concept Score의 절대값 합을 최소화
-            # (정상이면 어떤 병변 프로토타입과도 유사하면 안 됨)
-            loss_sparsity = torch.mean(torch.abs(concept_scores[normal_indices]))
+            # 정상 이미지(Grade 0)라면, 7x7 공간 어디에서도 반응이 없어야 함
+            # 맵 전체의 활성도(Probability) 평균을 낮춤
+            normal_probs = torch.sigmoid(spatial_sim_map[normal_indices])
+            loss_sparsity = normal_probs.mean()
 
         # Total Loss
         total_loss = loss_align + \
