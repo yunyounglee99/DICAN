@@ -585,7 +585,7 @@ if __name__ == "__main__":
     parser.add_argument('--n_tasks', type=int, default=4)
     parser.add_argument('--n_shot', type=int, default=10)
     parser.add_argument('--num_cluster', type=int, default=3)
-    parser.add_argument('--adaptation_steps', type=int, default=20)
+    parser.add_argument('--adaptation_steps', type=int, default=50)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--lr_base', type=float, default=1e-4)
     parser.add_argument('--lr_inc', type=float, default=1e-3)
