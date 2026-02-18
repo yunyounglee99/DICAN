@@ -1,22 +1,14 @@
 """
-DICAN Base Training - Enhanced 3-Phase (Separated Loaders)
+DICAN Base Training - DDR+FGADR 통합 세팅 (원래 세팅 복원)
 ============================================================
-[핵심 변경사항]
+★ Phase 1-A: DDR+FGADR 전체 → Backbone + Seg + Classification
+  - DDR 6260장: cls 100% 기여 + seg 4.4% 기여
+  - FGADR 1566장: cls + seg 100% 기여
+  - Backbone이 다양한 도메인의 DR 특징을 학습 → 높은 feature 품질
 
-★ Phase별 데이터 분리:
-  - Phase 1-A: FGADR만 (100% 마스크) → seg 수렴 보장
-  - Phase 1-B: DDR+FGADR 전체 → prototype 추출 (데이터 다양성)
-  - Phase 1-C: DDR+FGADR 전체 → CBM head 학습 (분류 다양성)
-
-★ Seg Loss 수렴 개선 (기존: 22→20 정체):
-  1. Dice smooth: 1.0 → 0.01 (극소 병변 gradient 100배 증가)
-  2. Focal BCE: pos_weight=10 추가 (양성 0.01% 불균형 해소)
-  3. Dice:Focal 비율: 0.5:0.5 → 0.7:0.3 (양성 학습 강화)
-  4. lambda_seg: 50 → 10 (pos_weight가 이미 gradient 증폭)
-
-Phase 1-A: Backbone + TempHead + SegDecoder (FGADR only)
-Phase 1-B: Backbone Freeze → Multi-Cluster Prototype 추출 (Full)
-Phase 1-C: Enhanced CBM Head 학습 (Full)
+★ Phase 1-B: DDR+FGADR 전체 → Prototype Extraction
+★ Phase 1-C: DDR+FGADR 전체 → CBM Head Training
+★ QWK 평가, DRAC22 Soft Label, adaptation_steps=20
 """
 
 import os
@@ -26,6 +18,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 import numpy as np
+from sklearn.metrics import cohen_kappa_score
 
 
 class BaseTrainer:
@@ -33,33 +26,33 @@ class BaseTrainer:
         """
         Args:
             loaders (dict): {
-                'seg_train': FGADR-only train loader (Phase 1-A),
-                'seg_val':   FGADR-only val loader   (Phase 1-A),
-                'full_train': DDR+FGADR train loader  (Phase 1-B/C),
-                'full_val':   DDR+FGADR val loader    (Phase 1-B/C),
+                'seg_train': FGADR-only train loader (Dice 평가용),
+                'seg_val':   FGADR-only val loader   (Dice 평가용),
+                'full_train': DDR+FGADR train loader  (★ Phase 1-A/B/C 모두 사용),
+                'full_val':   DDR+FGADR val loader    (★ Phase 1-A/B/C 모두 사용),
             }
         """
         self.args = args
         self.model = model
         self.device = device
         
-        # ★ Phase별 다른 loader 사용
+        # FGADR-only (Dice 평가 전용)
         self.seg_train_loader = loaders['seg_train']
         self.seg_val_loader = loaders['seg_val']
+        
+        # ★ DDR+FGADR 통합 (Phase 1-A/B/C 모두 사용)
         self.full_train_loader = loaders['full_train']
         self.full_val_loader = loaders['full_val']
 
     def check_data_statistics(self):
-        """Phase 1-A (seg) 데이터 통계 출력"""
-        print(f"\n[{'='*10} Phase 1-A Data (FGADR Only) {'='*10}]")
-        print(f"  Seg Train: {len(self.seg_train_loader.dataset)} samples")
-        print(f"  Seg Valid: {len(self.seg_val_loader.dataset)} samples")
-        print(f"  Full Train: {len(self.full_train_loader.dataset)} samples")
-        print(f"  Full Valid: {len(self.full_val_loader.dataset)} samples")
+        """★ Phase 1-A 데이터 통계 (DDR+FGADR 통합)"""
+        print(f"\n[{'='*10} Data Statistics {'='*10}]")
+        print(f"  Train: {len(self.full_train_loader.dataset)} samples")
+        print(f"  Valid: {len(self.full_val_loader.dataset)} samples")
         
         try:
-            batch = next(iter(self.seg_train_loader))
-            print(f"\n  [Seg Train Batch Check]")
+            batch = next(iter(self.full_train_loader))
+            print(f"\n  [Train Batch Check]")
             print(f"  Image: {batch['image'].shape}")
             if 'masks' in batch:
                 masks = batch['masks']
@@ -77,8 +70,7 @@ class BaseTrainer:
                     print(f"    {name}: {active_imgs}/{masks.size(0)} images, "
                           f"{active_pixels:,} pixels ({ratio:.2f}%)")
                 
-                unique_vals = torch.unique(masks)
-                if 1.0 in unique_vals:
+                if 1.0 in torch.unique(masks):
                     print("  ✅ 마스크에 양성 픽셀 존재 (정상)")
                 else:
                     print("  ⚠️ 마스크가 전부 0! 경로 확인 필요")
@@ -87,23 +79,24 @@ class BaseTrainer:
         print("=" * 45 + "\n")
 
     # =================================================================
-    # Phase 1-A: Backbone + Seg (FGADR Only, 100% Mask Coverage)
+    # Phase 1-A: Backbone + Seg (★ DDR+FGADR 통합)
     # =================================================================
     def phase_1a_pretrain(self):
         """
-        ★ FGADR만 사용 → 배치 100% 마스크 보장 → seg 확실히 수렴
+        ★ DDR+FGADR 통합 사용 (원래 세팅)
         
-        [Seg Loss 수렴 개선]
-        1. Dice smooth: 1.0 → 0.01 (극소 병변에서 gradient 100배↑)
-        2. Focal BCE + pos_weight=10 (양성 0.01% 불균형 해소)
-        3. Dice:Focal = 0.7:0.3 (Dice가 양성 학습의 핵심 드라이버)
-        4. lambda_seg: 50 → 10 (pos_weight가 이미 gradient 증폭)
+        - DDR 6260장: classification에 100% 기여, seg에 4.4% 기여
+        - FGADR 1566장: 둘 다 100% 기여
+        - Backbone이 다양한 도메인 + Grade 분포를 학습하여 
+          feature 품질이 높아짐 → 이후 Phase 1-C에서 71% 달성
         """
+        n_train = len(self.full_train_loader.dataset)
+        
         print(f"\n{'='*60}")
-        print(f"  Phase 1-A: Backbone + Pixel-Level Seg")
-        print(f"  ★ FGADR Only ({len(self.seg_train_loader.dataset)} samples, 100% mask)")
-        print(f"  ★ Dice(0.7) + Focal(0.3) | smooth=0.01 | pos_weight=10")
-        print(f"  ★ Early Stopping (patience=7)")
+        print(f"  Phase 1-A: Backbone + Pixel-Level Seg (Enhanced)")
+        print(f"  ★ DDR+FGADR ({n_train} samples)")
+        print(f"  ★ Dice + Focal Hybrid Seg Loss")
+        print(f"  ★ Early Stopping + Dice Loss")
         print(f"{'='*60}")
         
         self.model.set_session_mode('pretrain')
@@ -121,8 +114,6 @@ class BaseTrainer:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         
         class_weights = torch.tensor([0.5, 2.0, 2.0, 3.0, 3.0], device=self.device)
-        
-        # ★ lambda_seg: 50 → 10 (pos_weight=10이 gradient를 이미 증폭)
         lambda_seg = 10.0
         
         best_val_acc = 0.0
@@ -135,17 +126,15 @@ class BaseTrainer:
             self.model.projector.eval()
             self.model.head.eval()
             
-            total_loss = 0.0
-            total_cls = 0.0
-            total_seg = 0.0
             total_dice_val = 0.0
             correct = 0
             total = 0
             epoch_masked = 0
             seg_batches = 0
+            total_seg = 0.0
             
-            # ★ FGADR-only loader 사용
-            loop = tqdm(self.seg_train_loader, desc=f"[1-A] Epoch {epoch+1}/{epochs}")
+            # ★ DDR+FGADR 통합 loader 사용
+            loop = tqdm(self.full_train_loader, desc=f"[1-A] Epoch {epoch+1}/{epochs}")
             
             for batch_data in loop:
                 images = batch_data['image'].to(self.device)
@@ -158,26 +147,22 @@ class BaseTrainer:
                 cls_logits = outputs['logits']
                 seg_pred = outputs['seg_pred']
                 
-                # ─── Classification Loss (Label Smoothing) ───
+                # ─── Classification Loss (모든 샘플) ───
                 loss_cls = F.cross_entropy(
                     cls_logits, labels, 
                     weight=class_weights,
                     label_smoothing=0.1
                 )
                 
-                # ─── Seg Loss: Dice(0.7) + Focal(0.3) ───
-                # FGADR이므로 대부분 마스크 있음, 그래도 체크
+                # ─── Seg Loss (마스크 있는 샘플만) ───
                 has_mask = (masks.sum(dim=(1, 2, 3)) > 0)
                 
                 if has_mask.any():
                     seg_masked = seg_pred[has_mask]
                     masks_masked = masks[has_mask]
                     
-                    # ★ 개선된 loss 함수 사용
-                    loss_focal = self._focal_bce_loss(seg_masked, masks_masked, gamma=2.0, alpha=0.75)
+                    loss_focal = self._focal_bce_loss(seg_masked, masks_masked)
                     loss_dice = self._dice_loss(seg_masked, masks_masked)
-                    
-                    # ★ Dice 비중 증가: 양성 학습의 핵심 드라이버
                     loss_seg = 0.3 * loss_focal + 0.7 * loss_dice
                     
                     epoch_masked += has_mask.sum().item()
@@ -185,6 +170,7 @@ class BaseTrainer:
                     total_dice_val += loss_dice.item()
                 else:
                     loss_seg = torch.tensor(0.0, device=self.device)
+                    loss_dice = loss_seg
                 
                 loss = loss_cls + lambda_seg * loss_seg
                 
@@ -192,15 +178,12 @@ class BaseTrainer:
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=3.0)
                 optimizer.step()
                 
-                total_loss += loss.item()
-                total_cls += loss_cls.item()
                 total_seg += loss_seg.item()
                 
                 _, predicted = cls_logits.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
                 
-                # ★ dice loss도 표시
                 loop.set_postfix({
                     "cls": f"{loss_cls.item():.3f}",
                     "seg": f"{lambda_seg*loss_seg.item():.3f}",
@@ -210,16 +193,16 @@ class BaseTrainer:
             
             scheduler.step()
             train_acc = 100. * correct / total
-            avg_seg = total_seg / max(len(self.seg_train_loader), 1)
+            avg_seg = total_seg / max(len(self.full_train_loader), 1)
             avg_dice = total_dice_val / max(seg_batches, 1)
             
-            # ★ seg_val도 FGADR val로 평가
-            val_acc = self._validate_pretrain(class_weights)
+            # ★ DDR+FGADR 통합 val loader로 평가
+            val_acc, val_qwk = self._validate_pretrain()
             
             gap = train_acc - val_acc
             print(f"  Epoch {epoch+1}: Train={train_acc:.1f}%, Val={val_acc:.1f}%, "
-                  f"Gap={gap:.1f}%, SegLoss={lambda_seg*avg_seg:.4f}, "
-                  f"DiceLoss={avg_dice:.4f}, Masked={epoch_masked}")
+                  f"QWK={val_qwk:.4f}, Gap={gap:.1f}%, "
+                  f"SegLoss={lambda_seg*avg_seg:.4f}, Masked={epoch_masked}")
             
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
@@ -238,80 +221,55 @@ class BaseTrainer:
         
         self.load_model("phase1a_best.pth")
         
-        # Dice 메트릭 (FGADR val set 대상)
+        # Dice 평가는 FGADR val set으로 (100% 마스크)
         self._verify_seg_quality_pixel_level()
         
         print(f"\n[1-A] Complete. Best Val Acc: {best_val_acc:.2f}% (Epoch {best_epoch})")
         return best_val_acc
 
     def _dice_loss(self, pred, target, smooth=0.01):
-        """
-        ★ smooth: 1.0 → 0.01
-        
-        [이유] 양성 픽셀이 85개(MA)일 때:
-        - smooth=1.0: dice = (2*0 + 1)/(0+85+1) ≈ 0.012 → loss ≈ 0.99 (상수)
-        - smooth=0.01: dice = (2*0 + 0.01)/(0+85+0.01) ≈ 0.0001 → loss ≈ 1.0
-        → intersection 변화에 훨씬 민감한 gradient 제공
-        """
         pred_sig = torch.sigmoid(pred)
-        
         intersection = (pred_sig * target).sum(dim=(2, 3))
         union = pred_sig.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
-        
         dice = (2.0 * intersection + smooth) / (union + smooth)
-        
-        # 마스크가 존재하는 채널만 loss 계산
         has_target = (target.sum(dim=(2, 3)) > 0).float()
-        
         if has_target.sum() > 0:
-            dice_loss = ((1 - dice) * has_target).sum() / has_target.sum()
-        else:
-            dice_loss = torch.tensor(0.0, device=pred.device)
-        
-        return dice_loss
+            return ((1 - dice) * has_target).sum() / has_target.sum()
+        return torch.tensor(0.0, device=pred.device)
 
     def _focal_bce_loss(self, pred, target, gamma=2.0, alpha=0.75):
-        """
-        ★ pos_weight=10 추가
-        
-        [이유] 양성 픽셀이 0.01~0.13%로 극도로 희소
-        - BCE 자체가 음성에 압도적으로 편향됨
-        - pos_weight=10으로 양성 gradient를 10배 증폭
-        - 10000:1 불균형 → 1000:1로 개선
-        """
-        # ★ pos_weight: 양성 픽셀 gradient 10배 증폭
         pos_weight = torch.ones(pred.size(1), device=pred.device) * 10.0
         bce = F.binary_cross_entropy_with_logits(
             pred, target, reduction='none',
             pos_weight=pos_weight.view(1, -1, 1, 1)
         )
-        
         p = torch.sigmoid(pred)
         pt = p * target + (1 - p) * (1 - target)
         focal_weight = (1.0 - pt) ** gamma
         alpha_weight = alpha * target + (1 - alpha) * (1 - target)
-        loss = alpha_weight * focal_weight * bce
-        return loss.mean()
+        return (alpha_weight * focal_weight * bce).mean()
 
-    def _validate_pretrain(self, class_weights):
-        """★ FGADR val loader로 평가"""
+    def _validate_pretrain(self):
+        """★ DDR+FGADR 통합 val loader로 평가"""
         self.model.eval()
-        correct = 0
-        total = 0
+        correct, total = 0, 0
+        all_preds, all_labels = [], []
         with torch.no_grad():
-            for batch_data in self.seg_val_loader:
+            for batch_data in self.full_val_loader:
                 images = batch_data['image'].to(self.device)
                 labels = batch_data['label'].to(self.device)
                 outputs = self.model(images)
                 _, predicted = outputs['logits'].max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
-        return 100. * correct / total
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        acc = 100. * correct / total
+        qwk = cohen_kappa_score(all_labels, all_preds, weights='quadratic') if total > 0 else 0.0
+        return acc, qwk
 
     def _verify_seg_quality_pixel_level(self):
-        """
-        ★ FGADR val set 대상 Dice 계산 (100% 마스크 보장)
-        """
+        """FGADR val set 대상 Dice 계산 (100% 마스크 보장)"""
         print("\n[*] Pixel-Level Segmentation Quality (FGADR Validation Set):")
         self.model.eval()
         self.model.set_session_mode('pretrain')
@@ -352,22 +310,16 @@ class BaseTrainer:
                         
                         for i in range(p.size(0)):
                             if union_dice[i] > 0:
-                                dice_scores[k].append(
-                                    (2 * intersection[i] / union_dice[i]).item()
-                                )
+                                dice_scores[k].append((2 * intersection[i] / union_dice[i]).item())
                             if union_iou[i] > 0:
-                                iou_scores[k].append(
-                                    (intersection[i] / union_iou[i]).item()
-                                )
+                                iou_scores[k].append((intersection[i] / union_iou[i]).item())
         
         print(f"  {'Concept':>8} | {'Dice':>8} | {'IoU':>8} | {'Samples':>8}")
         print(f"  {'-'*42}")
         for k, name in enumerate(concept_names):
             if dice_scores[k]:
-                d = np.mean(dice_scores[k])
-                i = np.mean(iou_scores[k])
-                n = len(dice_scores[k])
-                print(f"  {name:>8} | {d:>8.4f} | {i:>8.4f} | {n:>8}")
+                print(f"  {name:>8} | {np.mean(dice_scores[k]):>8.4f} | "
+                      f"{np.mean(iou_scores[k]):>8.4f} | {len(dice_scores[k]):>8}")
             else:
                 print(f"  {name:>8} | {'N/A':>8} | {'N/A':>8} | {'0':>8}")
         print()
@@ -376,15 +328,6 @@ class BaseTrainer:
     # Phase 1-B: Multi-Cluster Prototype Extraction (Full Dataset)
     # =================================================================
     def phase_1b_extract_prototypes(self):
-        """
-        ★ DDR+FGADR 전체 데이터에서 prototype 추출
-        
-        [이유]
-        - Prototype은 다양한 도메인의 병변 특징을 포괄해야 함
-        - DDR의 275장 마스크도 prototype 추출에는 기여 가능
-          (backbone이 이미 FGADR로 잘 학습되었으므로)
-        - FGADR만으로는 DDR 도메인 특성을 반영 못함
-        """
         print(f"\n{'='*60}")
         print(f"  Phase 1-B: Multi-Cluster Prototype Extraction")
         print(f"  ★ Full Dataset: DDR+FGADR ({len(self.full_train_loader.dataset)} samples)")
@@ -395,7 +338,6 @@ class BaseTrainer:
         
         self.model.set_session_mode('extract')
         
-        # ★ full_train_loader 사용 (DDR+FGADR)
         self.model.prototypes.extract_prototypes_from_dataset(
             backbone=self.model.backbone,
             dataloader=self.full_train_loader,
@@ -404,8 +346,7 @@ class BaseTrainer:
         
         save_dir = getattr(self.args, 'save_path', './checkpoints')
         os.makedirs(save_dir, exist_ok=True)
-        proto_path = os.path.join(save_dir, "base_prototypes.pt")
-        self.model.prototypes.save_prototypes(proto_path)
+        self.model.prototypes.save_prototypes(os.path.join(save_dir, "base_prototypes.pt"))
         
         print(f"[1-B] Complete.")
 
@@ -413,14 +354,6 @@ class BaseTrainer:
     # Phase 1-C: Enhanced CBM Head Training (Full Dataset)
     # =================================================================
     def phase_1c_train_head(self):
-        """
-        ★ DDR+FGADR 전체로 CBM Head 학습
-        
-        [이유]
-        - 분류는 Grade 0~4 전체 분포가 필요
-        - DDR이 Grade 분포가 풍부 (6835장, 특히 Grade 0 다수)
-        - FGADR만으로는 Grade 0(Normal) 샘플이 부족
-        """
         print(f"\n{'='*60}")
         print(f"  Phase 1-C: Enhanced CBM Head Training")
         print(f"  ★ Full Dataset: DDR+FGADR ({len(self.full_train_loader.dataset)} samples)")
@@ -442,15 +375,14 @@ class BaseTrainer:
         class_weights = torch.tensor([0.5, 2.0, 2.0, 3.0, 3.0], device=self.device)
         
         best_val_acc = 0.0
+        best_val_qwk = 0.0
         patience = 5
         patience_counter = 0
         
         for epoch in range(epochs):
             self.model.head.train()
-            correct = 0
-            total = 0
+            correct, total = 0, 0
             
-            # ★ full_train_loader 사용 (DDR+FGADR)
             loop = tqdm(self.full_train_loader, desc=f"[1-C] Epoch {epoch+1}/{epochs}")
             
             for batch_data in loop:
@@ -465,12 +397,11 @@ class BaseTrainer:
                 
                 loss_cls = F.cross_entropy(logits, labels, weight=class_weights)
                 
-                # Sparsity: Grade 0 → 모든 concept 비활성화
+                # Sparsity: Grade 0 → concept 비활성화
                 loss_sp = torch.tensor(0.0, device=self.device)
                 normal = (labels == 0)
                 if normal.any() and concept_scores is not None:
-                    max_scores = concept_scores[normal, :self.model.num_concepts]
-                    loss_sp = torch.relu(max_scores).mean()
+                    loss_sp = torch.relu(concept_scores[normal, :self.model.num_concepts]).mean()
                 
                 loss = loss_cls + 0.3 * loss_sp
                 loss.backward()
@@ -488,19 +419,19 @@ class BaseTrainer:
             
             scheduler.step()
             
-            # ★ full_val_loader로 평가
-            val_acc = self._validate_head()
+            val_acc, val_qwk = self._validate_head()
             train_acc = 100. * correct / total
             
             print(f"  Epoch {epoch+1}: Train={train_acc:.1f}%, Val={val_acc:.1f}%, "
-                  f"Gap={train_acc-val_acc:.1f}%, "
+                  f"QWK={val_qwk:.4f}, Gap={train_acc-val_acc:.1f}%, "
                   f"Scale={self.model.prototypes.logit_scale.exp().item():.1f}")
             
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+                best_val_qwk = val_qwk
                 patience_counter = 0
                 self.save_model("phase1c_best.pth")
-                print(f"  ★ Best: {val_acc:.2f}%")
+                print(f"  ★ Best: {val_acc:.2f}% (QWK={val_qwk:.4f})")
             else:
                 patience_counter += 1
                 print(f"  (patience: {patience_counter}/{patience})")
@@ -515,10 +446,9 @@ class BaseTrainer:
         return best_val_acc
 
     def _validate_head(self):
-        """★ full_val_loader로 평가 (DDR+FGADR)"""
         self.model.eval()
-        correct = 0
-        total = 0
+        correct, total = 0, 0
+        all_preds, all_labels = [], []
         with torch.no_grad():
             for batch_data in self.full_val_loader:
                 images = batch_data['image'].to(self.device)
@@ -529,10 +459,13 @@ class BaseTrainer:
                 _, predicted = logits.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
-        return 100. * correct / total
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        acc = 100. * correct / total
+        qwk = cohen_kappa_score(all_labels, all_preds, weights='quadratic') if total > 0 else 0.0
+        return acc, qwk
 
     def _analyze_concept_scores(self):
-        """Multi-cluster score 분석 (12차원)"""
         print("\n[*] Concept Score Analysis by DR Grade:")
         self.model.eval()
         
@@ -548,7 +481,6 @@ class BaseTrainer:
                     if m.any():
                         grade_scores[g].append(scores[m].cpu())
         
-        nc = self.model.num_concepts
         names = ([f"{n}_max" for n in ["EX","HE","MA","SE"]] +
                  [f"{n}_mean" for n in ["EX","HE","MA","SE"]] +
                  [f"{n}_std" for n in ["EX","HE","MA","SE"]])
@@ -567,10 +499,10 @@ class BaseTrainer:
     # =================================================================
     def run(self):
         print(f"\n{'='*60}")
-        print(f"  DICAN Enhanced 3-Phase Training")
-        print(f"  ★ Phase 1-A: FGADR only → Backbone + Seg")
-        print(f"  ★ Phase 1-B: DDR+FGADR  → Prototype Extraction")
-        print(f"  ★ Phase 1-C: DDR+FGADR  → CBM Head Training")
+        print(f"  DICAN 3-Phase Training (DDR+FGADR 통합)")
+        print(f"  ★ Phase 1-A: DDR+FGADR → Backbone + Seg")
+        print(f"  ★ Phase 1-B: DDR+FGADR → Prototype Extraction")
+        print(f"  ★ Phase 1-C: DDR+FGADR → CBM Head Training")
         print(f"  ★ Seg Fix: smooth=0.01, pos_weight=10, Dice:Focal=0.7:0.3")
         print(f"{'='*60}")
         self.check_data_statistics()
@@ -581,8 +513,8 @@ class BaseTrainer:
         
         print(f"\n{'='*60}")
         print(f"  Base Training Complete!")
-        print(f"  Phase 1-A (Backbone+PixelSeg, FGADR): {acc_1a:.2f}%")
-        print(f"  Phase 1-C (CBM Head, DDR+FGADR):      {acc_1c:.2f}%")
+        print(f"  Phase 1-A (Backbone+PixelSeg): {acc_1a:.2f}%")
+        print(f"  Phase 1-C (CBM Head):          {acc_1c:.2f}%")
         print(f"{'='*60}\n")
         
         return self.model
@@ -594,5 +526,201 @@ class BaseTrainer:
 
     def load_model(self, filename):
         d = getattr(self.args, 'save_path', './checkpoints')
-        path = os.path.join(d, filename)
-        self.model.load_state_dict(torch.load(path, map_location=self.device), strict=False)
+        self.model.load_state_dict(
+            torch.load(os.path.join(d, filename), map_location=self.device), strict=False)
+
+
+# =================================================================
+# Incremental Loader Manager
+# =================================================================
+class IncrementalLoaderManager:
+    """Incremental Session 데이터 로더 관리"""
+    def __init__(self, data_root, n_shot=10, batch_size=32, seed=42):
+        self.data_root = data_root
+        self.n_shot = n_shot
+        self.batch_size = batch_size
+        self.seed = seed
+
+    def get_incremental_loaders(self, task_id, mode_override=None):
+        from data.inc_loader import get_incremental_loader
+        
+        if mode_override == 'test':
+            test_loader = get_incremental_loader(
+                session_id=task_id, data_root=self.data_root,
+                mode='test', batch_size=self.batch_size, shot=None)
+            return None, test_loader
+        
+        support_loader = get_incremental_loader(
+            session_id=task_id, data_root=self.data_root,
+            mode='train', batch_size=self.batch_size, shot=self.n_shot)
+        query_loader = get_incremental_loader(
+            session_id=task_id, data_root=self.data_root,
+            mode='test', batch_size=self.batch_size, shot=None)
+        return support_loader, query_loader
+
+
+# =================================================================
+# Main Entry Point
+# =================================================================
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    _this_dir = os.path.dirname(os.path.abspath(__file__))
+    _parent_dir = os.path.join(_this_dir, '..')
+    sys.path.insert(0, _this_dir)
+    sys.path.insert(0, _parent_dir)
+
+    from train_incremental import IncrementalTrainer
+    from models import DICAN_CBM
+    from data.base_loader import DDRBaseDataset
+    from data.fgadr_loader import FGADRSegDataset
+    from utils.metrics import Evaluator
+
+    # ─── Arguments ───
+    parser = argparse.ArgumentParser(description='DICAN Training')
+    parser.add_argument('--data_path', type=str, default='/root/DICAN_DATASETS')
+    parser.add_argument('--epochs_base', type=int, default=30)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--n_tasks', type=int, default=4)
+    parser.add_argument('--n_shot', type=int, default=10)
+    parser.add_argument('--num_cluster', type=int, default=3)
+    parser.add_argument('--adaptation_steps', type=int, default=20)
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--lr_base', type=float, default=1e-4)
+    parser.add_argument('--lr_inc', type=float, default=1e-3)
+    parser.add_argument('--save_path', type=str, default='./checkpoints')
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
+    args.n_concepts = 4
+    args.num_classes = 5
+
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+
+    print(f"\n{'='*50}")
+    print(f"🚀 DICAN Training (DDR+FGADR 통합)")
+    print(f"   - Data Root: {args.data_path}")
+    print(f"   - Device: {device}")
+    print(f"   - Concepts: {args.n_concepts}")
+    print(f"   - Clusters per concept: {args.num_cluster}")
+    score_dim = args.n_concepts * 3
+    print(f"   - Score dim: {score_dim} (Max+Mean+Std)")
+    print(f"   - Head: {score_dim}→64→32→16→5 (Residual)")
+    print(f"   - Tasks: {args.n_tasks} (1 base + {args.n_tasks-1} incremental)")
+    print(f"   - Shot: {args.n_shot}")
+    print(f"   - Adaptation steps: {args.adaptation_steps}")
+    print(f"{'='*50}")
+
+    # ─── 1. Data Loading ───
+    print("\n[*] Loading Base Data...")
+    ddr_root = os.path.join(args.data_path, 'DDR')
+    fgadr_root = os.path.join(args.data_path, 'FGADR')
+    print(f"    DDR:   {ddr_root}")
+    print(f"    FGADR: {fgadr_root}")
+
+    ddr_train = DDRBaseDataset(root_dir=ddr_root, split='train')
+    ddr_val = DDRBaseDataset(root_dir=ddr_root, split='valid')
+    fgadr_train = FGADRSegDataset(root_dir=fgadr_root, split='train')
+    fgadr_val = FGADRSegDataset(root_dir=fgadr_root, split='valid')
+
+    from torch.utils.data import ConcatDataset, DataLoader
+
+    full_train = ConcatDataset([ddr_train, fgadr_train])
+    full_val = ConcatDataset([ddr_val, fgadr_val])
+
+    print(f"\n    ✅ Combined Dataset:")
+    print(f"       Train: DDR({len(ddr_train)}) + FGADR({len(fgadr_train)}) = {len(full_train)}")
+    print(f"       Valid: DDR({len(ddr_val)}) + FGADR({len(fgadr_val)}) = {len(full_val)}")
+
+    nw = 4
+    # FGADR-only (Dice 평가 전용)
+    seg_train_loader = DataLoader(fgadr_train, batch_size=args.batch_size,
+                                  shuffle=True, num_workers=nw, pin_memory=True)
+    seg_val_loader = DataLoader(fgadr_val, batch_size=args.batch_size,
+                                shuffle=False, num_workers=nw, pin_memory=True)
+    # ★ DDR+FGADR 통합 (Phase 1-A/B/C 사용)
+    full_train_loader = DataLoader(full_train, batch_size=args.batch_size,
+                                   shuffle=True, num_workers=nw, pin_memory=True)
+    full_val_loader = DataLoader(full_val, batch_size=args.batch_size,
+                                 shuffle=False, num_workers=nw, pin_memory=True)
+
+    loaders = {
+        'seg_train': seg_train_loader,
+        'seg_val': seg_val_loader,
+        'full_train': full_train_loader,
+        'full_val': full_val_loader,
+    }
+
+    # ─── 2. Model ───
+    model = DICAN_CBM(
+        num_concepts=args.n_concepts, num_classes=args.num_classes,
+        feature_dim=2048, num_clusters=args.num_cluster
+    ).to(device)
+
+    # ─── 3. Base Training (Phase 1-A/B/C) ───
+    base_trainer = BaseTrainer(args, model, device, loaders)
+    model = base_trainer.run()
+
+    # ─── 4. Incremental Setup ───
+    inc_manager = IncrementalLoaderManager(
+        data_root=args.data_path, n_shot=args.n_shot,
+        batch_size=args.batch_size, seed=args.seed)
+
+    evaluator = Evaluator(
+        model=model, device=device, base_val_loader=full_val_loader,
+        inc_loader_manager=inc_manager, args=args)
+
+    # ─── 5. Base Evaluation ───
+    print(f"\n[Eval] Evaluation after Base Session...")
+    model.set_session_mode('eval')
+    evaluator.evaluate_all_tasks(current_session_id=0)
+    m0 = evaluator.calculate_metrics(current_session_id=0)
+    print(f"   >>> Base Avg Acc: {m0['avg_acc']:.2f}%")
+    print(f"   >>> Base Avg QWK: {m0['avg_kappa']:.4f}")
+
+    # ─── 6. Incremental Tasks ───
+    print(f"\n🔄 Starting Incremental Phase ({args.n_tasks - 1} tasks)")
+    print(f"   Adaptation steps: {args.adaptation_steps}")
+
+    inc_trainer = IncrementalTrainer(
+        args=args, model=model, device=device, inc_loader=inc_manager)
+
+    for task_id in range(1, args.n_tasks):
+        task_acc = inc_trainer.train_task(task_id)
+        
+        model.set_session_mode('eval')
+        evaluator.evaluate_all_tasks(current_session_id=task_id)
+        m = evaluator.calculate_metrics(current_session_id=task_id)
+        
+        print(f"\n   📊 Metrics after Task {task_id}:")
+        print(f"   - Avg Accuracy    : {m['avg_acc']:.2f}%")
+        print(f"   - Avg QWK         : {m['avg_kappa']:.4f}")
+        print(f"   - BWT             : {m['bwt']:.2f}%")
+        print(f"   - BWT (QWK)       : {m['bwt_kappa']:.4f}")
+        print(f"   - Forgetting      : {m['forgetting']:.2f}%")
+        print(f"   - Forgetting (QWK): {m['forgetting_kappa']:.4f}")
+        print(f"   - Task Accuracies : {m['raw_accs']}")
+        print(f"   - Task QWKs       : {m['raw_kappas']}")
+
+    # ─── 7. Final Summary ───
+    final = evaluator.calculate_metrics(current_session_id=args.n_tasks - 1)
+    print(f"\n{'='*50}")
+    print(f"  🏁 DICAN Training Complete!")
+    print(f"{'='*50}")
+    print(f"   - Final Avg Acc : {final['avg_acc']:.2f}%")
+    print(f"   - Final Avg QWK : {final['avg_kappa']:.4f}")
+    print(f"   - Final BWT     : {final['bwt']:.2f}%")
+    print(f"   - Final FWT     : {final['fwt']:.2f}%")
+    print(f"   - Final Forget  : {final['forgetting']:.2f}%")
+    print(f"\n   [QWK Details]")
+    print(f"   - BWT (QWK)     : {final['bwt_kappa']:.4f}")
+    print(f"   - FWT (QWK)     : {final['fwt_kappa']:.4f}")
+    print(f"   - Forget (QWK)  : {final['forgetting_kappa']:.4f}")
+
+    print(f"\n   [Accuracy Matrix R]")
+    for i in range(args.n_tasks):
+        print("   " + "  ".join(f"{evaluator.R[i][j]:6.2f}" for j in range(args.n_tasks)))
+
+    print(f"\n   [QWK Matrix]")
+    for i in range(args.n_tasks):
+        print("   " + "  ".join(f"{evaluator.R_kappa[i][j]:6.4f}" for j in range(args.n_tasks)))

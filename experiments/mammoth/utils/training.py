@@ -17,6 +17,7 @@ from tqdm.auto import tqdm
 from datasets import get_dataset
 from datasets.utils.continual_dataset import ContinualDataset, MammothDatasetWrapper
 from datasets.utils.gcl_dataset import GCLDataset
+from datasets.dr_graiding import DRGrading
 from models.utils.continual_model import ContinualModel
 from models.utils.future_model import FutureModel
 
@@ -315,6 +316,18 @@ def train(model: ContinualModel, dataset: ContinualDataset,
             model.meta_end_task(dataset)
 
             accs = eval_dataset.evaluate(model, eval_dataset)
+
+            # =================================================================
+            # [★ 추가] DR Grading 데이터셋일 경우 QWK(Quadratic Weighted Kappa) 평가 실행
+            # =================================================================
+            if dataset.NAME == 'dr-grading':
+                # dr_graiding.py에 정의된 evaluate_with_qwk 클래스 메서드 호출
+                # 현재까지 학습된 모든 Task에 대해 QWK를 계산하여 출력함
+                try:
+                    DRGrading.evaluate_with_qwk(model, args.device)
+                except Exception as e:
+                    print(f"[Warning] Failed to compute QWK: {e}")
+            # =================================================================
 
             if args.eval_future and cur_task < dataset.N_TASKS - 1:
                 transf_accs = accs[0][cur_task + 1:], accs[1][cur_task + 1:]

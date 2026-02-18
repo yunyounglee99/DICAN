@@ -2,6 +2,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class PrototypeContrastiveLoss(nn.Module):
+    """
+    [신규 추가] 프로토타입 간 직교성(Orthogonality) 강제
+    
+    목표: 출혈(HE) 벡터와 삼출물(EX) 벡터가 서로 비슷해지는 것을 방지.
+    방법: Cosine Similarity Matrix가 단위 행렬(Identity)에 가까워지도록 학습.
+    """
+    def __init__(self):
+        super(PrototypeContrastiveLoss, self).__init__()
+
+    def forward(self, prototypes):
+        """
+        Args:
+            prototypes: [num_concepts, dim] 형태의 Centroids
+        """
+        if prototypes.dim() == 3: 
+            # Multi-Cluster인 경우 [K, Cluster, Dim] -> [K, Dim] (평균으로 Centroid 계산)
+            prototypes = prototypes.mean(dim=1)
+            
+        # 1. Normalize
+        p_norm = F.normalize(prototypes, p=2, dim=1)
+        
+        # 2. Gram Matrix (Cosine Similarity)
+        # [K, Dim] @ [Dim, K] -> [K, K]
+        sim_matrix = torch.mm(p_norm, p_norm.t())
+        
+        # 3. Identity Matrix (Target)
+        eye = torch.eye(sim_matrix.size(0), device=sim_matrix.device)
+        
+        # 4. MSE Loss (Off-diagonal elements should be 0)
+        # 대각 성분(1)은 유지하고, 비대각 성분(서로 다른 개념 간 유사도)을 0으로 누름
+        loss = (sim_matrix - eye).pow(2).mean()
+        
+        return loss
+
 class DICANLoss(nn.Module):
     """
     DICAN Loss - Multi-Cluster Prototype 대응 버전
@@ -20,6 +55,9 @@ class DICANLoss(nn.Module):
         self.lambda_ordinal = 1.0
         self.lambda_sparsity = 0.5
         self.lambda_align = 1.0
+        self.lambda_ortho = 0.5
+
+        self.loss_ortho_fn = PrototypeContrastiveLoss()
 
         # 의학적 규칙: Grade별 병변 존재 여부
         self.register_buffer('concept_rule_matrix', torch.tensor([
@@ -56,6 +94,12 @@ class DICANLoss(nn.Module):
                 loss_sparsity = torch.relu(max_scores[normal_mask]).mean()
                 total_loss = total_loss + 0.3 * loss_sparsity
                 log_dict["loss_sparsity"] = loss_sparsity.item()
+
+        prototypes = outputs.get('prototypes') 
+        if prototypes is not None:
+            loss_ortho = self.loss_ortho_fn(prototypes)
+            total_loss = total_loss + self.lambda_ortho * loss_ortho
+            log_dict["loss_ortho"] = loss_ortho.item()
         
         return total_loss, log_dict
 
@@ -75,8 +119,8 @@ class DICANLoss(nn.Module):
         loss_align = F.binary_cross_entropy(concept_probs, expected_concepts)
 
         # 2. Ordinal Regression Loss
-        class_weights = torch.tensor([0.5, 2.0, 2.0, 3.0, 3.0], device=logits.device)
-        ce_loss = F.cross_entropy(logits, labels, weight=class_weights, reduction='none')
+        # class_weights = torch.tensor([0.5, 2.0, 2.0, 3.0, 3.0], device=logits.device)
+        ce_loss = F.cross_entropy(logits, labels, reduction='none') #weight=class_weights
         
         pred_labels = torch.argmax(logits, dim=1)
         distance = labels - pred_labels
@@ -104,3 +148,4 @@ class DICANLoss(nn.Module):
 
     def set_mode(self, mode):
         self.mode = mode
+

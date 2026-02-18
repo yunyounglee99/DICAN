@@ -48,6 +48,7 @@ class PrototypeBank(nn.Module):
         
         # Scale Factor
         self.logit_scale = nn.Parameter(torch.ones([]) * 3.0)
+        self.pooling_temp = nn.Parameter(torch.ones([]) * 1.0)
         
         # Score 차원: Max + Mean + Std = 3K
         self.score_dim = num_concepts * 3
@@ -92,8 +93,9 @@ class PrototypeBank(nn.Module):
         batch, ch, h, w = features.shape
         z = F.normalize(features, p=2, dim=1)  # [B, C, H, W]
         scale = self.logit_scale.exp().clamp(max=100.0)
+        tau = self.pooling_temp.clamp(min=0.1, max=5.0)
         
-        all_max = []
+        all_lse = []
         all_mean = []
         all_std = []
         spatial_maps = []
@@ -109,17 +111,17 @@ class PrototypeBank(nn.Module):
             scaled_sim = best_sim * scale
             flat_sim = scaled_sim.flatten(1)  # [B, H*W]
             
-            score_max, _ = flat_sim.max(dim=1)
+            score_lse = tau * torch.logsumexp(flat_sim / tau, dim= 1)
             score_mean = flat_sim.mean(dim=1)
             score_std = flat_sim.std(dim=1)
             
-            all_max.append(score_max)
+            all_lse.append(score_lse)
             all_mean.append(score_mean)
             all_std.append(score_std)
             spatial_maps.append(best_sim.unsqueeze(1))
         
         concept_scores = torch.cat([
-            torch.stack(all_max, dim=1),
+            torch.stack(all_lse, dim=1),
             torch.stack(all_mean, dim=1),
             torch.stack(all_std, dim=1),
         ], dim=1)
