@@ -1,5 +1,11 @@
 from .backbone import ResNetBackbone
-from .projector import ConceptProjector
+from .projector import (
+    ConceptProjector, 
+    LoRAProjector, 
+    Linear1LayerProjector, 
+    Linear2LayerProjector,
+    build_projector
+)
 from .prototypes import PrototypeBank
 from .head import OrdinalRegressionHead
 from .seg_decoder import SegDecoder

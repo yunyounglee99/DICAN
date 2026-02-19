@@ -663,6 +663,7 @@ def load_inc_task_for_resume(model, resume_task_id, args, device):
 if __name__ == "__main__":
     import argparse
     import sys
+    import os
 
     _this_dir = os.path.dirname(os.path.abspath(__file__))
     _parent_dir = os.path.join(_this_dir, '..')
@@ -683,7 +684,7 @@ if __name__ == "__main__":
     parser.add_argument('--n_tasks', type=int, default=4)
     parser.add_argument('--n_shot', type=int, default=10)
     parser.add_argument('--num_cluster', type=int, default=3)
-    parser.add_argument('--adaptation_steps', type=int, default=200)
+    parser.add_argument('--adaptation_steps', type=int, default=50)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--lr_base', type=float, default=1e-4)
     parser.add_argument('--lr_inc', type=float, default=1e-3)
@@ -691,17 +692,29 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument(
         '--skip_base', action='store_true',
-        help='Base Session(Phase 1-A/B/C)을 건너뛰고 저장된 체크포인트에서 '
-             'Incremental Session만 실행합니다. '
-             'checkpoints/ 폴더에 phase1c_best.pth와 base_prototypes.pt가 필요합니다.'
+        help='Base Session(Phase 1-A/B/C)을 건너뛰고 Incremental Session만 실행.'
     )
     parser.add_argument(
         '--resume_from_task', type=int, default=0,
-        help='특정 Incremental Task 번호부터 재개합니다. '
-             '--skip_base와 함께 사용하세요. '
-             '예) --skip_base --resume_from_task 2 '
-             '→ inc_task1_full.pth를 로드하고 Task 2부터 학습. '
-             '0이면 Task 1부터 시작 (기본값).'
+        help='특정 Incremental Task 번호부터 재개.'
+    )
+    
+    # ★ Projector Ablation Arguments
+    parser.add_argument(
+        '--projector_type', type=str, default='lora',
+        choices=['lora', 'linear_1layer', 'linear_2layer'],
+        help='Projector 아키텍처 선택. '
+             'lora: Low-Rank Residual (Ours, 262K params), '
+             'linear_1layer: 1-Layer Linear CBM (4.2M params), '
+             'linear_2layer: 2-Layer Linear CBM with BN (2.1M params)'
+    )
+    parser.add_argument(
+        '--projector_rank', type=int, default=64,
+        help='LoRA rank (lora 타입에만 적용). 32/64(권장)/128'
+    )
+    parser.add_argument(
+        '--projector_hidden', type=int, default=512,
+        help='2-Layer hidden dim (linear_2layer 타입에만 적용). 256/512'
     )
 
     args = parser.parse_args()
@@ -722,12 +735,18 @@ if __name__ == "__main__":
     print(f"   - Tasks: {args.n_tasks} (1 base + {args.n_tasks-1} incremental)")
     print(f"   - Shot: {args.n_shot}")
     print(f"   - Adaptation steps: {args.adaptation_steps}")
+    
+    # ★ Projector 정보 출력
+    print(f"   - Projector type: {args.projector_type}")
+    if args.projector_type == 'lora':
+        print(f"   - LoRA rank: {args.projector_rank}")
+    elif args.projector_type == 'linear_2layer':
+        print(f"   - Hidden dim: {args.projector_hidden}")
 
     if args.skip_base:
-        print(f"\n   ★ --skip_base: Base Session 건너뜀 (체크포인트 로드)")
+        print(f"\n   ★ --skip_base: Base Session 건너뜀")
         if args.resume_from_task > 0:
-            print(f"   ★ --resume_from_task {args.resume_from_task}: "
-                  f"Task {args.resume_from_task}부터 재개")
+            print(f"   ★ --resume_from_task {args.resume_from_task}")
     
     print(f"{'='*50}")
 
@@ -744,6 +763,7 @@ if __name__ == "__main__":
     fgadr_val = FGADRSegDataset(root_dir=fgadr_root, split='valid')
 
     from torch.utils.data import ConcatDataset, DataLoader
+    import torch
 
     full_train = ConcatDataset([ddr_train, fgadr_train])
     full_val = ConcatDataset([ddr_val, fgadr_val])
@@ -753,12 +773,10 @@ if __name__ == "__main__":
     print(f"       Valid: DDR({len(ddr_val)}) + FGADR({len(fgadr_val)}) = {len(full_val)}")
 
     nw = 4
-    # FGADR-only (Dice 평가 전용)
     seg_train_loader = DataLoader(fgadr_train, batch_size=args.batch_size,
                                   shuffle=True, num_workers=nw, pin_memory=True)
     seg_val_loader = DataLoader(fgadr_val, batch_size=args.batch_size,
                                 shuffle=False, num_workers=nw, pin_memory=True)
-    # ★ DDR+FGADR 통합 (Phase 1-A/B/C 사용)
     full_train_loader = DataLoader(full_train, batch_size=args.batch_size,
                                    shuffle=True, num_workers=nw, pin_memory=True)
     full_val_loader = DataLoader(full_val, batch_size=args.batch_size,
@@ -771,33 +789,38 @@ if __name__ == "__main__":
         'full_val': full_val_loader,
     }
 
-    # ─── 2. Model ───
+    # ─── 2. Model (★ projector_type 반영) ───
+    projector_kwargs = {}
+    if args.projector_type == 'lora':
+        projector_kwargs['rank'] = args.projector_rank
+    elif args.projector_type == 'linear_2layer':
+        projector_kwargs['hidden_dim'] = args.projector_hidden
+
     model = DICAN_CBM(
-        num_concepts=args.n_concepts, num_classes=args.num_classes,
-        feature_dim=2048, num_clusters=args.num_cluster
+        num_concepts=args.n_concepts, 
+        num_classes=args.num_classes,
+        feature_dim=2048, 
+        num_clusters=args.num_cluster,
+        projector_type=args.projector_type,
+        projector_kwargs=projector_kwargs
     ).to(device)
 
-    # ─── 3. Base Training (Phase 1-A/B/C) ───
+    # ─── 3. Base Training ───
+    # (BaseTrainer import는 기존과 동일)
+    from train.train import BaseTrainer, IncrementalLoaderManager, \
+        load_base_for_incremental, load_inc_task_for_resume
+    
     if not args.skip_base:
-        # ============================================
-        # 기존 동작: Base Training (Phase 1-A → 1-B → 1-C)
-        # ============================================
         base_trainer = BaseTrainer(args, model, device, loaders)
         model = base_trainer.run()
     else:
-        # ============================================
-        # ★ [추가] Inc Session 재개: 체크포인트 로드
-        # ============================================
         print(f"\n{'='*60}")
         print(f"  ★ Skip Base Session — Loading Saved Checkpoints")
         print(f"{'='*60}")
         
         if args.resume_from_task > 1:
-            # 특정 Inc Task 체크포인트에서 재개
-            model = load_inc_task_for_resume(
-                model, args.resume_from_task, args, device)
+            model = load_inc_task_for_resume(model, args.resume_from_task, args, device)
         else:
-            # Base checkpoint + Prototype 로드
             model = load_base_for_incremental(model, args, device)
 
     # ─── 4. Incremental Setup ───
@@ -820,12 +843,8 @@ if __name__ == "__main__":
     # ─── 6. Incremental Tasks ───
     if args.skip_base and args.resume_from_task > 1:
         actual_start = args.resume_from_task
-        
-        # 이미 완료된 Task들의 R matrix를 채우기 위해 eval만 수행
         print(f"\n  [*] Filling R matrix for previously completed tasks...")
         for prev_task in range(1, actual_start):
-            print(f"      Evaluating Task {prev_task} (already completed)...")
-
             model.set_session_mode('eval')
             evaluator.evaluate_all_tasks(current_session_id=prev_task)
     else:
@@ -833,11 +852,13 @@ if __name__ == "__main__":
 
     print(f"\n🔄 Starting Incremental Phase ({args.n_tasks - 1} tasks)")
     print(f"   Adaptation steps: {args.adaptation_steps}")
+    print(f"   Projector: {args.projector_type} ({model.projector.get_param_count():,} params)")
 
+    from train.train_incremental import IncrementalTrainer
     inc_trainer = IncrementalTrainer(
         args=args, model=model, device=device, inc_loader=inc_manager)
 
-    for task_id in range(1, args.n_tasks):
+    for task_id in range(actual_start, args.n_tasks):
         task_acc = inc_trainer.train_task(task_id)
         
         model.set_session_mode('eval')
@@ -848,9 +869,7 @@ if __name__ == "__main__":
         print(f"   - Avg Accuracy    : {m['avg_acc']:.2f}%")
         print(f"   - Avg QWK         : {m['avg_kappa']:.4f}")
         print(f"   - BWT             : {m['bwt']:.2f}%")
-        print(f"   - BWT (QWK)       : {m['bwt_kappa']:.4f}")
         print(f"   - Forgetting      : {m['forgetting']:.2f}%")
-        print(f"   - Forgetting (QWK): {m['forgetting_kappa']:.4f}")
         print(f"   - Task Accuracies : {m['raw_accs']}")
         print(f"   - Task QWKs       : {m['raw_kappas']}")
 
@@ -858,21 +877,12 @@ if __name__ == "__main__":
     final = evaluator.calculate_metrics(current_session_id=args.n_tasks - 1)
     print(f"\n{'='*50}")
     print(f"  🏁 DICAN Training Complete!")
+    print(f"  Projector: {args.projector_type} ({model.projector.get_param_count():,} params)")
     print(f"{'='*50}")
     print(f"   - Final Avg Acc : {final['avg_acc']:.2f}%")
     print(f"   - Final Avg QWK : {final['avg_kappa']:.4f}")
     print(f"   - Final BWT     : {final['bwt']:.2f}%")
     print(f"   - Final FWT     : {final['fwt']:.2f}%")
     print(f"   - Final Forget  : {final['forgetting']:.2f}%")
-    print(f"\n   [QWK Details]")
-    print(f"   - BWT (QWK)     : {final['bwt_kappa']:.4f}")
-    print(f"   - FWT (QWK)     : {final['fwt_kappa']:.4f}")
-    print(f"   - Forget (QWK)  : {final['forgetting_kappa']:.4f}")
 
-    print(f"\n   [Accuracy Matrix R]")
-    for i in range(args.n_tasks):
-        print("   " + "  ".join(f"{evaluator.R[i][j]:6.2f}" for j in range(args.n_tasks)))
 
-    print(f"\n   [QWK Matrix]")
-    for i in range(args.n_tasks):
-        print("   " + "  ".join(f"{evaluator.R_kappa[i][j]:6.4f}" for j in range(args.n_tasks)))
