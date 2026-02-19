@@ -563,14 +563,15 @@ def load_base_for_incremental(model, args, device):
     저장된 Base Session 체크포인트 + 프로토타입을 로드하여
     Incremental Session을 바로 시작할 수 있는 상태로 만듦.
     
-    로드 순서 (우선순위):
-      1단계 - 모델 가중치:
-        phase1c_best.pth > best_base_model.pth > phase1a_best.pth
-      2단계 - 프로토타입:
-        base_prototypes.pt
-    
-    기존 BaseTrainer.save_model()이 저장한 파일들을 그대로 사용.
+    ★ Projector Ablation 대응:
+    Base checkpoint의 projector 가중치와 현재 모델의 projector 아키텍처가
+    다를 수 있으므로 (예: checkpoint=lora, 현재=linear_1layer),
+    projector.* 키는 shape이 맞지 않으면 스킵함.
+    Projector는 Base Session에서 identity였으므로 스킵해도 무방.
     """
+    import os
+    import torch
+    
     save_dir = getattr(args, 'save_path', './checkpoints')
     
     # ─── 1단계: 모델 가중치 로드 ───
@@ -588,18 +589,49 @@ def load_base_for_incremental(model, args, device):
             print(f"      ({desc})")
             
             ckpt = torch.load(path, map_location=device)
-            # BaseTrainer.save_model()은 model.state_dict()를 직접 저장함
             if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-                model.load_state_dict(ckpt['model_state_dict'], strict=False)
+                state_dict = ckpt['model_state_dict']
             else:
-                model.load_state_dict(ckpt, strict=False)
+                state_dict = ckpt
             
+            # ★ Projector 키 필터링: shape mismatch 방지
+            model_state = model.state_dict()
+            filtered_state = {}
+            skipped_keys = []
+            
+            for k, v in state_dict.items():
+                if k in model_state:
+                    if v.shape == model_state[k].shape:
+                        filtered_state[k] = v
+                    else:
+                        skipped_keys.append((k, v.shape, model_state[k].shape))
+                else:
+                    # 모델에 없는 키 (예: 이전 버전의 파라미터) → 무시
+                    skipped_keys.append((k, v.shape, None))
+            
+            if skipped_keys:
+                projector_skips = [s for s in skipped_keys if 'projector' in s[0]]
+                other_skips = [s for s in skipped_keys if 'projector' not in s[0]]
+                
+                if projector_skips:
+                    print(f"  [Info] Projector 가중치 {len(projector_skips)}개 스킵 "
+                          f"(아키텍처 변경: checkpoint → 현재 모델)")
+                    for k, ckpt_shape, model_shape in projector_skips:
+                        print(f"         {k}: {ckpt_shape} → {model_shape}")
+                    print(f"  [Info] Projector는 Base에서 identity이므로 "
+                          f"새 아키텍처의 초기 가중치를 그대로 사용합니다.")
+                
+                if other_skips:
+                    print(f"  [⚠️] Non-projector 키 {len(other_skips)}개도 스킵됨:")
+                    for k, ckpt_shape, model_shape in other_skips:
+                        print(f"       {k}: {ckpt_shape} → {model_shape}")
+            
+            model.load_state_dict(filtered_state, strict=False)
             model_loaded = True
             
             if filename == "phase1a_best.pth":
                 print(f"  [⚠️] WARNING: phase1a_best.pth만 발견됨!")
                 print(f"       Phase 1-B(Prototype), 1-C(Head)가 미완료 상태입니다.")
-                print(f"       Inc Session 성능이 낮을 수 있습니다.")
             
             break
     
@@ -621,8 +653,6 @@ def load_base_for_incremental(model, args, device):
               f"(exp: {learned_logit_scale.exp().item():.4f})")
     else:
         print(f"  [⚠️] Prototype file NOT found: {proto_path}")
-        print(f"       Prototype Bank이 초기화되지 않은 상태입니다!")
-        print(f"       Phase 1-B를 실행하지 않았거나 파일이 삭제되었을 수 있습니다.")
     
     return model
 
@@ -807,9 +837,6 @@ if __name__ == "__main__":
 
     # ─── 3. Base Training ───
     # (BaseTrainer import는 기존과 동일)
-    from train.train import BaseTrainer, IncrementalLoaderManager, \
-        load_base_for_incremental, load_inc_task_for_resume
-    
     if not args.skip_base:
         base_trainer = BaseTrainer(args, model, device, loaders)
         model = base_trainer.run()
@@ -854,7 +881,6 @@ if __name__ == "__main__":
     print(f"   Adaptation steps: {args.adaptation_steps}")
     print(f"   Projector: {args.projector_type} ({model.projector.get_param_count():,} params)")
 
-    from train.train_incremental import IncrementalTrainer
     inc_trainer = IncrementalTrainer(
         args=args, model=model, device=device, inc_loader=inc_manager)
 

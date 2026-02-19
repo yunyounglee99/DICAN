@@ -97,10 +97,46 @@ CONCEPT_TO_IDX = {name: i for i, name in enumerate(CONCEPT_NAMES)}
 # =================================================================
 # 모델 로딩
 # =================================================================
+def _detect_num_clusters(checkpoint_dir, device):
+    """
+    체크포인트에서 num_clusters를 자동 감지.
+    
+    방법 1: base_prototypes.pt의 'num_clusters' 키
+    방법 2: base_prototypes.pt의 prototypes 텐서 shape[1]
+    방법 3: model checkpoint의 prototypes.prototypes shape[1]
+    """
+    # 방법 1, 2: Prototype 파일에서 감지
+    proto_path = os.path.join(checkpoint_dir, "base_prototypes.pt")
+    if os.path.exists(proto_path):
+        proto_ckpt = torch.load(proto_path, map_location=device)
+        if isinstance(proto_ckpt, dict):
+            if 'num_clusters' in proto_ckpt:
+                return proto_ckpt['num_clusters']
+            if 'prototypes' in proto_ckpt:
+                return proto_ckpt['prototypes'].shape[1]
+    
+    # 방법 3: Model checkpoint에서 감지
+    model_candidates = ["phase1c_best.pth", "best_base_model.pth", "phase1a_best.pth"]
+    for fname in model_candidates:
+        path = os.path.join(checkpoint_dir, fname)
+        if os.path.exists(path):
+            ckpt = torch.load(path, map_location=device)
+            state = ckpt.get('model_state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
+            key = 'prototypes.prototypes'
+            if key in state:
+                return state[key].shape[1]
+    
+    return None  # 감지 실패
+
+
 def load_model(checkpoint_dir, device, projector_type='lora', 
                projector_kwargs=None, num_clusters=3):
     """
     체크포인트에서 모델 로드.
+    
+    ★ num_clusters 자동 감지: checkpoint의 prototype shape에서
+       실제 cluster 수를 읽어 모델을 생성하므로,
+       --num_cluster 인자를 생략해도 shape mismatch가 발생하지 않음.
     
     로드 우선순위:
       1. phase1c_best.pth (Phase 1-A/B/C 완료)
@@ -110,6 +146,13 @@ def load_model(checkpoint_dir, device, projector_type='lora',
     """
     if projector_kwargs is None:
         projector_kwargs = {}
+    
+    # ★ 체크포인트에서 num_clusters 자동 감지
+    detected = _detect_num_clusters(checkpoint_dir, device)
+    if detected is not None and detected != num_clusters:
+        print(f"[*] Auto-detected num_clusters={detected} from checkpoint "
+              f"(argument was {num_clusters})")
+        num_clusters = detected
     
     model = DICAN_CBM(
         num_concepts=NUM_CONCEPTS,
@@ -632,6 +675,17 @@ Examples:
     parser.add_argument('--save_results', type=str, default=None,
                         help='결과를 .pt 파일로 저장')
     
+    # ★ 샘플 필터링 옵션
+    parser.add_argument('--target_label', type=int, default=None,
+                        choices=[0, 1, 2, 3, 4],
+                        help='특정 Ground Truth 라벨의 샘플을 선택. '
+                             '예: --target_label 3 → Grade 3 샘플 중에서 선택')
+    parser.add_argument('--find_misdiagnosed', type=int, default=None,
+                        choices=[0, 1, 2, 3, 4],
+                        help='특정 라벨이 다른 Grade로 오진된 샘플을 자동 탐색. '
+                             '예: --find_misdiagnosed 3 → GT=3인데 예측이 3이 아닌 샘플을 찾음. '
+                             '--target_label과 함께 사용하면 target_label은 무시됨.')
+    
     args = parser.parse_args()
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -671,7 +725,95 @@ Examples:
     
     # ─── 2. 샘플 로드 ───
     print(f"\n[*] Loading sample...")
-    sample, dataset = get_sample(args.data_path, args.task_id, args.sample_idx)
+    
+    if args.find_misdiagnosed is not None:
+        # ★ 오진 샘플 자동 탐색
+        target_gt = args.find_misdiagnosed
+        print(f"  [*] Searching for misdiagnosed samples (GT={target_gt}, pred≠{target_gt})...")
+        
+        sample, dataset = get_sample(args.data_path, args.task_id, 0)
+        
+        # 모델을 intervention 모드로
+        model.set_session_mode('intervention')
+        
+        found = False
+        found_idx = -1
+        scan_limit = min(len(dataset), 500)  # 최대 500개 스캔
+        
+        for idx in range(scan_limit):
+            s = dataset[idx]
+            s_label = s['label'].item() if isinstance(s['label'], torch.Tensor) else s['label']
+            
+            if s_label != target_gt:
+                continue
+            
+            # 예측 수행
+            with torch.no_grad():
+                img_tensor = s['image'].unsqueeze(0).to(device)
+                out = model(img_tensor)
+                scores = out['concept_scores']
+                logits = model.predict_from_concepts(scores)
+                pred = logits.argmax(dim=1).item()
+            
+            if pred != target_gt:
+                sample = s
+                found = True
+                found_idx = idx
+                print(f"  ✅ Found at index {idx}: GT={target_gt} → Pred={pred}")
+                break
+        
+        if not found:
+            print(f"  [⚠️] No misdiagnosed sample found for GT={target_gt} "
+                  f"(scanned {scan_limit} samples)")
+            print(f"       Falling back to first GT={target_gt} sample...")
+            # fallback: 해당 label 첫 번째 샘플
+            for idx in range(len(dataset)):
+                s = dataset[idx]
+                s_label = s['label'].item() if isinstance(s['label'], torch.Tensor) else s['label']
+                if s_label == target_gt:
+                    sample = s
+                    found_idx = idx
+                    break
+        
+        args.sample_idx = found_idx
+    
+    elif args.target_label is not None:
+        # ★ 특정 라벨 샘플 선택
+        target_gt = args.target_label
+        print(f"  [*] Searching for sample with label={target_gt}...")
+        
+        _, dataset = get_sample(args.data_path, args.task_id, 0)
+        
+        found = False
+        count = 0
+        for idx in range(len(dataset)):
+            s = dataset[idx]
+            s_label = s['label'].item() if isinstance(s['label'], torch.Tensor) else s['label']
+            
+            if s_label == target_gt:
+                if count == args.sample_idx:
+                    sample = s
+                    found = True
+                    print(f"  ✅ Found GT={target_gt} sample at dataset index {idx} "
+                          f"(#{args.sample_idx} among label={target_gt})")
+                    args.sample_idx = idx  # 실제 인덱스로 업데이트
+                    break
+                count += 1
+        
+        if not found:
+            print(f"  [⚠️] Only {count} samples with label={target_gt}, "
+                  f"using last one")
+            # 마지막으로 찾은 것 사용
+            for idx in range(len(dataset)):
+                s = dataset[idx]
+                s_label = s['label'].item() if isinstance(s['label'], torch.Tensor) else s['label']
+                if s_label == target_gt:
+                    sample = s
+                    args.sample_idx = idx
+    
+    else:
+        # 기존 동작: sample_idx로 직접 접근
+        sample, dataset = get_sample(args.data_path, args.task_id, args.sample_idx)
     
     image = sample['image']
     label = sample['label']

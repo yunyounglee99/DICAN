@@ -1,0 +1,209 @@
+
+==================================================
+🚀 DICAN Training (DDR+FGADR 통합)
+   - Data Root: /root/DICAN_DATASETS
+   - Device: cuda
+   - Concepts: 4
+   - Clusters per concept: 5
+   - Score dim: 12 (Max+Mean+Std)
+   - Head: 12→64→32→16→5 (Residual)
+   - Tasks: 4 (1 base + 3 incremental)
+   - Shot: 10
+   - Adaptation steps: 50
+   - Projector type: linear_1layer
+
+   ★ --skip_base: Base Session 건너뜀
+==================================================
+
+[*] Loading Base Data...
+    DDR:   /root/DICAN_DATASETS/DDR
+    FGADR: /root/DICAN_DATASETS/FGADR
+[*] Loading DDR (train) from local disk: /root/DICAN_DATASETS/DDR
+    -> 6260 samples loaded.
+    -> [Note] Discarded 575 samples with label 5 (Ungradable).
+    -> Mask available: 275/6260 images (4.4%)
+[*] Loading DDR (valid) from local disk: /root/DICAN_DATASETS/DDR
+    -> 2503 samples loaded.
+    -> [Note] Discarded 230 samples with label 5 (Ungradable).
+    -> Mask available: 31/2503 images (1.2%)
+[*] Loading FGADR Seg-set (train) from: /root/DICAN_DATASETS/FGADR/Seg-set
+    -> CSV: 1842 entries parsed.
+    -> Mask available: 1566/1566 (100.0%)
+    -> 1566 samples loaded for 'train'.
+[*] Loading FGADR Seg-set (valid) from: /root/DICAN_DATASETS/FGADR/Seg-set
+    -> CSV: 1842 entries parsed.
+    -> Mask available: 276/276 (100.0%)
+    -> 276 samples loaded for 'valid'.
+
+    ✅ Combined Dataset:
+       Train: DDR(6260) + FGADR(1566) = 7826
+       Valid: DDR(2503) + FGADR(276) = 2779
+[DICAN] Projector: type=linear_1layer, dim=2048, params=4,194,304
+
+============================================================
+  ★ Skip Base Session — Loading Saved Checkpoints
+============================================================
+  [✓] Model weights loaded: ./checkpoints/phase1c_best.pth
+      (Phase 1-C Best (Head 학습 완료))
+  [Info] Projector 가중치 2개 스킵 (아키텍처 변경: checkpoint → 현재 모델)
+         projector.layer.0.weight: torch.Size([64, 2048, 1, 1]) → torch.Size([2048, 2048, 1, 1])
+         projector.layer.2.weight: torch.Size([2048, 64, 1, 1]) → None
+  [Info] Projector는 Base에서 identity이므로 새 아키텍처의 초기 가중치를 그대로 사용합니다.
+  [✓] Prototypes loaded: ./checkpoints/base_prototypes.pt
+[*] Prototypes loaded from ./checkpoints/base_prototypes.pt
+  [✓] logit_scale restored: 2.5863 (exp: 13.2810)
+
+[Eval] Evaluation after Base Session...
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 0)...
+    -> Task 0 Acc: 74.02%  |  QWK: 0.7706
+    -> Task 1 Acc: 58.31%  |  QWK: 0.6789
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 56.57%  |  QWK: 0.4243
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 45.16%  |  QWK: 0.2149
+   >>> Base Avg Acc: 74.02%
+   >>> Base Avg QWK: 0.7706
+
+🔄 Starting Incremental Phase (3 tasks)
+   Adaptation steps: 50
+   Projector: linear_1layer (4,194,304 params)
+
+==================== [Phase 2] Incremental Task 1 ====================
+[TRAIN] Session 1: Few-shot applied -> 50 samples.
+
+  Task 1 Data:
+    Support: 50 samples
+    Query:   367 samples
+[*] Adapting Projector for Task 1...
+
+[*] DICAN mode → INCREMENTAL
+   → Projector(linear_1layer): Trainable (4,194,304 params)
+   → All else:  Frozen
+    Step [20/50] Loss: 1.9738 (align=1.254, ord=0.190, anchor=0.000)
+    Step [40/50] Loss: 1.2261 (align=1.068, ord=0.078, anchor=0.000)
+
+[*] DICAN mode → EVAL
+Eval Task 1:   0%|          | 0/12 [00:00<?, ?it/s]Eval Task 1:   8%|▊         | 1/12 [00:04<00:44,  4.01s/it]Eval Task 1:  42%|████▏     | 5/12 [00:07<00:09,  1.33s/it]Eval Task 1:  75%|███████▌  | 9/12 [00:10<00:03,  1.01s/it]Eval Task 1: 100%|██████████| 12/12 [00:10<00:00,  1.14it/s]
+    [Save] Full model  → ./checkpoints/inc_task1_full.pth
+    [Save] Projector   → ./checkpoints/inc_task1_projector.pth
+==================== Task 1 Done (Acc: 70.30%) ====================
+
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 1)...
+    -> Task 0 Acc: 59.09%  |  QWK: 0.7110
+    -> Task 1 Acc: 70.30%  |  QWK: 0.7775
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 59.43%  |  QWK: 0.4797
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 50.00%  |  QWK: 0.3857
+
+   📊 Metrics after Task 1:
+   - Avg Accuracy    : 64.69%
+   - Avg QWK         : 0.7442
+   - BWT             : -14.93%
+   - Forgetting      : 14.93%
+   - Task Accuracies : [59.08600216 70.29972752]
+   - Task QWKs       : [0.71097986 0.77746596]
+
+==================== [Phase 2] Incremental Task 2 ====================
+  [Messidor-2] Dropped 4 rows with missing labels.
+[TRAIN] Session 2: Few-shot applied -> 50 samples.
+  [Messidor-2] Dropped 4 rows with missing labels.
+
+  Task 2 Data:
+    Support: 50 samples
+    Query:   175 samples
+[*] Adapting Projector for Task 2...
+
+[*] DICAN mode → INCREMENTAL
+   → Projector(linear_1layer): Trainable (4,194,304 params)
+   → All else:  Frozen
+    Step [20/50] Loss: 1.0831 (align=0.503, ord=0.502, anchor=0.000)
+    Step [40/50] Loss: 0.6125 (align=0.340, ord=0.268, anchor=0.000)
+
+[*] DICAN mode → EVAL
+Eval Task 2:   0%|          | 0/6 [00:00<?, ?it/s]Eval Task 2:  17%|█▋        | 1/6 [00:02<00:10,  2.00s/it]Eval Task 2:  33%|███▎      | 2/6 [00:02<00:04,  1.05s/it]Eval Task 2:  83%|████████▎ | 5/6 [00:03<00:00,  2.04it/s]Eval Task 2: 100%|██████████| 6/6 [00:03<00:00,  1.83it/s]
+    [Save] Full model  → ./checkpoints/inc_task2_full.pth
+    [Save] Projector   → ./checkpoints/inc_task2_projector.pth
+==================== Task 2 Done (Acc: 54.86%) ====================
+
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 2)...
+    -> Task 0 Acc: 50.63%  |  QWK: 0.6906
+    -> Task 1 Acc: 55.31%  |  QWK: 0.7218
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 54.86%  |  QWK: 0.5167
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 37.10%  |  QWK: 0.3529
+
+   📊 Metrics after Task 2:
+   - Avg Accuracy    : 53.60%
+   - Avg QWK         : 0.6431
+   - BWT             : -19.19%
+   - Forgetting      : 19.19%
+   - Task Accuracies : [50.62972292 55.3133515  54.85714286]
+   - Task QWKs       : [0.69062741 0.72180205 0.51672292]
+
+==================== [Phase 2] Incremental Task 3 ====================
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 225 labels remapped to Global Standard (0, 2, 4).
+[TRAIN] Session 3: Few-shot applied -> 30 samples.
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+
+  Task 3 Data:
+    Support: 30 samples
+    Query:   62 samples
+[*] Adapting Projector for Task 3...
+
+[*] DICAN mode → INCREMENTAL
+   → Projector(linear_1layer): Trainable (4,194,304 params)
+   → All else:  Frozen
+    Step [20/50] Loss: 0.9366 (align=0.663, ord=0.098, anchor=0.000)
+    Step [40/50] Loss: 0.4241 (align=0.364, ord=0.053, anchor=0.000)
+
+[*] DICAN mode → EVAL
+Eval Task 3:   0%|          | 0/2 [00:00<?, ?it/s]Eval Task 3:  50%|█████     | 1/2 [00:01<00:01,  1.50s/it]Eval Task 3: 100%|██████████| 2/2 [00:01<00:00,  1.28it/s]
+    [Save] Full model  → ./checkpoints/inc_task3_full.pth
+    [Save] Projector   → ./checkpoints/inc_task3_projector.pth
+==================== Task 3 Done (Acc: 62.90%) ====================
+
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 3)...
+    -> Task 0 Acc: 42.93%  |  QWK: 0.5499
+    -> Task 1 Acc: 39.78%  |  QWK: 0.5320
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 52.00%  |  QWK: 0.4554
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 62.90%  |  QWK: 0.4233
+
+   📊 Metrics after Task 3:
+   - Avg Accuracy    : 49.40%
+   - Avg QWK         : 0.4902
+   - BWT             : -21.49%
+   - Forgetting      : 23.01%
+   - Task Accuracies : [42.92911119 39.78201635 52.         62.90322581]
+   - Task QWKs       : [0.54991184 0.53197503 0.45539185 0.4233483 ]
+
+==================================================
+  🏁 DICAN Training Complete!
+  Projector: linear_1layer (4,194,304 params)
+==================================================
+   - Final Avg Acc : 49.40%
+   - Final Avg QWK : 0.4902
+   - Final BWT     : -21.49%
+   - Final FWT     : 51.61%
+   - Final Forget  : 23.01%
