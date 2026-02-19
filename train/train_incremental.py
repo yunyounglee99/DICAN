@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.optim as optim
 from tqdm import tqdm
@@ -47,6 +48,10 @@ class IncrementalTrainer:
         # ★ Projector anchor (L2 reg 기준점)
         self.projector_anchor = None
 
+        self.save_dir = getattr(self.args, 'save_path', './checkpoints')
+        os.makedirs(self.save_dir, exist_ok=True)
+
+
     def train_task(self, task_id):
         print(f"\n{'='*20} [Phase 2] Incremental Task {task_id} {'='*20}")
         
@@ -67,9 +72,69 @@ class IncrementalTrainer:
         
         # Evaluation
         acc = self.evaluate(query_loader, task_id)
+
+        self.save_task_checkpoint(task_id, acc)
         
         print(f"{'='*20} Task {task_id} Done (Acc: {acc:.2f}%) {'='*20}\n")
         return acc
+
+    def save_task_checkpoint(self, task_id, acc):
+        """
+        Incremental Task 완료 후 체크포인트 저장.
+        
+        저장 파일:
+          1. inc_task{id}_full.pth      — 전체 모델 state_dict + 메타 정보
+          2. inc_task{id}_projector.pth  — Projector만 (경량, ablation용)
+        """
+        # 1. 전체 모델
+        full_path = os.path.join(self.save_dir, f"inc_task{task_id}_full.pth")
+        torch.save({
+            'task_id': task_id,
+            'model_state_dict': self.model.state_dict(),
+            'accuracy': acc,
+            'adaptation_steps': self.args.adaptation_steps,
+            'n_shot': self.args.n_shot,
+            'lr_inc': self.args.lr_inc,
+        }, full_path)
+        print(f"    [Save] Full model  → {full_path}")
+        
+        # 2. Projector만
+        proj_path = os.path.join(self.save_dir, f"inc_task{task_id}_projector.pth")
+        torch.save({
+            'task_id': task_id,
+            'projector_state_dict': self.model.projector.state_dict(),
+            'accuracy': acc,
+        }, proj_path)
+        print(f"    [Save] Projector   → {proj_path}")
+
+    def load_task_checkpoint(self, task_id, projector_only=False):
+        """
+        특정 Task의 체크포인트 로드.
+        
+        Args:
+            task_id: 로드할 Task ID
+            projector_only: True면 Projector만 로드
+        Returns:
+            저장 시점 accuracy
+        """
+        if projector_only:
+            path = os.path.join(self.save_dir, f"inc_task{task_id}_projector.pth")
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Projector checkpoint not found: {path}")
+            ckpt = torch.load(path, map_location=self.device)
+            self.model.projector.load_state_dict(ckpt['projector_state_dict'])
+            loaded_acc = ckpt.get('accuracy', 0.0)
+            print(f"    [Load] Projector ← {path} (Acc: {loaded_acc:.2f}%)")
+        else:
+            path = os.path.join(self.save_dir, f"inc_task{task_id}_full.pth")
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Full checkpoint not found: {path}")
+            ckpt = torch.load(path, map_location=self.device)
+            self.model.load_state_dict(ckpt['model_state_dict'], strict=False)
+            loaded_acc = ckpt.get('accuracy', 0.0)
+            print(f"    [Load] Full model ← {path} (Acc: {loaded_acc:.2f}%)")
+        
+        return loaded_acc
 
     def _reset_projector_near_identity(self):
         """
@@ -120,13 +185,13 @@ class IncrementalTrainer:
         }
         
         # ★ 학습률 및 스텝 조정
-        base_lr = self.args.lr_inc * 0.5  # 기존보다 절반
+        base_lr = self.args.lr_inc  # 기존보다 절반
         warmup_steps = max(self.args.adaptation_steps // 5, 10)
         
-        optimizer = optim.SGD(
+        optimizer = optim.Adam(
             trainable_params,
             lr=base_lr,
-            momentum=0.9,
+            # momentum=0.9,
             weight_decay=1e-4
         )
         
@@ -143,10 +208,13 @@ class IncrementalTrainer:
                 batch_data = next(iterator)
             
             # ★ Warmup LR
+            '''
             if step < warmup_steps:
                 lr = base_lr * (step + 1) / warmup_steps
                 for pg in optimizer.param_groups:
                     pg['lr'] = lr
+            '''
+            
             
             images = batch_data['image'].to(self.device)
             labels = batch_data['label'].to(self.device)

@@ -558,6 +558,104 @@ class IncrementalLoaderManager:
             mode='test', batch_size=self.batch_size, shot=None)
         return support_loader, query_loader
 
+def load_base_for_incremental(model, args, device):
+    """
+    저장된 Base Session 체크포인트 + 프로토타입을 로드하여
+    Incremental Session을 바로 시작할 수 있는 상태로 만듦.
+    
+    로드 순서 (우선순위):
+      1단계 - 모델 가중치:
+        phase1c_best.pth > best_base_model.pth > phase1a_best.pth
+      2단계 - 프로토타입:
+        base_prototypes.pt
+    
+    기존 BaseTrainer.save_model()이 저장한 파일들을 그대로 사용.
+    """
+    save_dir = getattr(args, 'save_path', './checkpoints')
+    
+    # ─── 1단계: 모델 가중치 로드 ───
+    model_candidates = [
+        ("phase1c_best.pth",    "Phase 1-C Best (Head 학습 완료)"),
+        ("best_base_model.pth", "Best Base Model"),
+        ("phase1a_best.pth",    "Phase 1-A Best (⚠️ Head 미학습 — Phase 1-C 필요)"),
+    ]
+    
+    model_loaded = False
+    for filename, desc in model_candidates:
+        path = os.path.join(save_dir, filename)
+        if os.path.exists(path):
+            print(f"  [✓] Model weights loaded: {path}")
+            print(f"      ({desc})")
+            
+            ckpt = torch.load(path, map_location=device)
+            # BaseTrainer.save_model()은 model.state_dict()를 직접 저장함
+            if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+                model.load_state_dict(ckpt['model_state_dict'], strict=False)
+            else:
+                model.load_state_dict(ckpt, strict=False)
+            
+            model_loaded = True
+            
+            if filename == "phase1a_best.pth":
+                print(f"  [⚠️] WARNING: phase1a_best.pth만 발견됨!")
+                print(f"       Phase 1-B(Prototype), 1-C(Head)가 미완료 상태입니다.")
+                print(f"       Inc Session 성능이 낮을 수 있습니다.")
+            
+            break
+    
+    if not model_loaded:
+        raise FileNotFoundError(
+            f"\n  [ERROR] Base checkpoint not found in: {save_dir}\n"
+            f"  Expected one of: {[c[0] for c in model_candidates]}\n"
+            f"  → Base Session을 먼저 실행하세요 (--skip_base 없이)."
+        )
+    
+    # ─── 2단계: 프로토타입 로드 ───
+    proto_path = os.path.join(save_dir, "base_prototypes.pt")
+    if os.path.exists(proto_path):
+        print(f"  [✓] Prototypes loaded: {proto_path}")
+        learned_logit_scale = model.prototypes.logit_scale.data.clone()
+        model.prototypes.load_prototypes(proto_path)
+        model.prototypes.logit_scale.data = learned_logit_scale
+        print(f"  [✓] logit_scale restored: {learned_logit_scale.item():.4f} "
+              f"(exp: {learned_logit_scale.exp().item():.4f})")
+    else:
+        print(f"  [⚠️] Prototype file NOT found: {proto_path}")
+        print(f"       Prototype Bank이 초기화되지 않은 상태입니다!")
+        print(f"       Phase 1-B를 실행하지 않았거나 파일이 삭제되었을 수 있습니다.")
+    
+    return model
+
+def load_inc_task_for_resume(model, resume_task_id, args, device):
+    """
+    --resume_from_task N 사용 시: Task (N-1)의 체크포인트를 로드.
+    
+    예: --resume_from_task 2 → inc_task1_full.pth를 로드하고 Task 2부터 시작.
+    예: --resume_from_task 1 → Base checkpoint를 로드하고 Task 1부터 시작.
+    
+    Inc Task 체크포인트가 없으면 Base checkpoint로 fallback.
+    """
+    save_dir = getattr(args, 'save_path', './checkpoints')
+    prev_task = resume_task_id - 1
+    
+    if prev_task >= 1:
+        # 이전 Inc Task의 체크포인트 시도
+        full_path = os.path.join(save_dir, f"inc_task{prev_task}_full.pth")
+        if os.path.exists(full_path):
+            print(f"  [✓] Inc Task {prev_task} checkpoint loaded: {full_path}")
+            ckpt = torch.load(full_path, map_location=device)
+            model.load_state_dict(ckpt['model_state_dict'], strict=False)
+            prev_acc = ckpt.get('accuracy', 0.0)
+            print(f"      (Task {prev_task} Acc was: {prev_acc:.2f}%)")
+            return model
+        else:
+            print(f"  [⚠️] inc_task{prev_task}_full.pth not found.")
+            print(f"       Base checkpoint로 fallback합니다.")
+    
+    # Fallback: Base checkpoint 로드
+    model = load_base_for_incremental(model, args, device)
+    return model
+
 
 # =================================================================
 # Main Entry Point
@@ -585,12 +683,27 @@ if __name__ == "__main__":
     parser.add_argument('--n_tasks', type=int, default=4)
     parser.add_argument('--n_shot', type=int, default=10)
     parser.add_argument('--num_cluster', type=int, default=3)
-    parser.add_argument('--adaptation_steps', type=int, default=50)
+    parser.add_argument('--adaptation_steps', type=int, default=200)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--lr_base', type=float, default=1e-4)
     parser.add_argument('--lr_inc', type=float, default=1e-3)
     parser.add_argument('--save_path', type=str, default='./checkpoints')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument(
+        '--skip_base', action='store_true',
+        help='Base Session(Phase 1-A/B/C)을 건너뛰고 저장된 체크포인트에서 '
+             'Incremental Session만 실행합니다. '
+             'checkpoints/ 폴더에 phase1c_best.pth와 base_prototypes.pt가 필요합니다.'
+    )
+    parser.add_argument(
+        '--resume_from_task', type=int, default=0,
+        help='특정 Incremental Task 번호부터 재개합니다. '
+             '--skip_base와 함께 사용하세요. '
+             '예) --skip_base --resume_from_task 2 '
+             '→ inc_task1_full.pth를 로드하고 Task 2부터 학습. '
+             '0이면 Task 1부터 시작 (기본값).'
+    )
+
     args = parser.parse_args()
     args.n_concepts = 4
     args.num_classes = 5
@@ -609,6 +722,13 @@ if __name__ == "__main__":
     print(f"   - Tasks: {args.n_tasks} (1 base + {args.n_tasks-1} incremental)")
     print(f"   - Shot: {args.n_shot}")
     print(f"   - Adaptation steps: {args.adaptation_steps}")
+
+    if args.skip_base:
+        print(f"\n   ★ --skip_base: Base Session 건너뜀 (체크포인트 로드)")
+        if args.resume_from_task > 0:
+            print(f"   ★ --resume_from_task {args.resume_from_task}: "
+                  f"Task {args.resume_from_task}부터 재개")
+    
     print(f"{'='*50}")
 
     # ─── 1. Data Loading ───
@@ -658,8 +778,27 @@ if __name__ == "__main__":
     ).to(device)
 
     # ─── 3. Base Training (Phase 1-A/B/C) ───
-    base_trainer = BaseTrainer(args, model, device, loaders)
-    model = base_trainer.run()
+    if not args.skip_base:
+        # ============================================
+        # 기존 동작: Base Training (Phase 1-A → 1-B → 1-C)
+        # ============================================
+        base_trainer = BaseTrainer(args, model, device, loaders)
+        model = base_trainer.run()
+    else:
+        # ============================================
+        # ★ [추가] Inc Session 재개: 체크포인트 로드
+        # ============================================
+        print(f"\n{'='*60}")
+        print(f"  ★ Skip Base Session — Loading Saved Checkpoints")
+        print(f"{'='*60}")
+        
+        if args.resume_from_task > 1:
+            # 특정 Inc Task 체크포인트에서 재개
+            model = load_inc_task_for_resume(
+                model, args.resume_from_task, args, device)
+        else:
+            # Base checkpoint + Prototype 로드
+            model = load_base_for_incremental(model, args, device)
 
     # ─── 4. Incremental Setup ───
     inc_manager = IncrementalLoaderManager(
@@ -679,6 +818,19 @@ if __name__ == "__main__":
     print(f"   >>> Base Avg QWK: {m0['avg_kappa']:.4f}")
 
     # ─── 6. Incremental Tasks ───
+    if args.skip_base and args.resume_from_task > 1:
+        actual_start = args.resume_from_task
+        
+        # 이미 완료된 Task들의 R matrix를 채우기 위해 eval만 수행
+        print(f"\n  [*] Filling R matrix for previously completed tasks...")
+        for prev_task in range(1, actual_start):
+            print(f"      Evaluating Task {prev_task} (already completed)...")
+
+            model.set_session_mode('eval')
+            evaluator.evaluate_all_tasks(current_session_id=prev_task)
+    else:
+        actual_start = 1
+
     print(f"\n🔄 Starting Incremental Phase ({args.n_tasks - 1} tasks)")
     print(f"   Adaptation steps: {args.adaptation_steps}")
 

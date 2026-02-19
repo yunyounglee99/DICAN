@@ -1,0 +1,224 @@
+
+==================================================
+🚀 DICAN Training (DDR+FGADR 통합)
+   - Data Root: /root/DICAN_DATASETS
+   - Device: cuda
+   - Concepts: 4
+   - Clusters per concept: 10
+   - Score dim: 12 (Max+Mean+Std)
+   - Head: 12→64→32→16→5 (Residual)
+   - Tasks: 4 (1 base + 3 incremental)
+   - Shot: 5
+   - Adaptation steps: 50
+
+   ★ --skip_base: Base Session 건너뜀 (체크포인트 로드)
+==================================================
+
+[*] Loading Base Data...
+    DDR:   /root/DICAN_DATASETS/DDR
+    FGADR: /root/DICAN_DATASETS/FGADR
+[*] Loading DDR (train) from local disk: /root/DICAN_DATASETS/DDR
+    -> 6260 samples loaded.
+    -> [Note] Discarded 575 samples with label 5 (Ungradable).
+    -> Mask available: 275/6260 images (4.4%)
+[*] Loading DDR (valid) from local disk: /root/DICAN_DATASETS/DDR
+    -> 2503 samples loaded.
+    -> [Note] Discarded 230 samples with label 5 (Ungradable).
+    -> Mask available: 31/2503 images (1.2%)
+[*] Loading FGADR Seg-set (train) from: /root/DICAN_DATASETS/FGADR/Seg-set
+    -> CSV: 1842 entries parsed.
+    -> Mask available: 1566/1566 (100.0%)
+    -> 1566 samples loaded for 'train'.
+[*] Loading FGADR Seg-set (valid) from: /root/DICAN_DATASETS/FGADR/Seg-set
+    -> CSV: 1842 entries parsed.
+    -> Mask available: 276/276 (100.0%)
+    -> 276 samples loaded for 'valid'.
+
+    ✅ Combined Dataset:
+       Train: DDR(6260) + FGADR(1566) = 7826
+       Valid: DDR(2503) + FGADR(276) = 2779
+
+============================================================
+  ★ Skip Base Session — Loading Saved Checkpoints
+============================================================
+  [✓] Model weights loaded: ./checkpoints/phase1c_best.pth
+      (Phase 1-C Best (Head 학습 완료))
+  [✓] Prototypes loaded: ./checkpoints/base_prototypes.pt
+[*] Prototypes loaded from ./checkpoints/base_prototypes.pt
+  [✓] logit_scale restored: 1.8350 (exp: 6.2652)
+
+[Eval] Evaluation after Base Session...
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 0)...
+    -> Task 0 Acc: 76.25%  |  QWK: 0.7986
+    -> Task 1 Acc: 70.30%  |  QWK: 0.7888
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 58.29%  |  QWK: 0.5055
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 51.61%  |  QWK: 0.3158
+   >>> Base Avg Acc: 76.25%
+   >>> Base Avg QWK: 0.7986
+
+🔄 Starting Incremental Phase (3 tasks)
+   Adaptation steps: 50
+
+==================== [Phase 2] Incremental Task 1 ====================
+[TRAIN] Session 1: Few-shot applied -> 25 samples.
+
+  Task 1 Data:
+    Support: 25 samples
+    Query:   367 samples
+[*] Adapting Projector for Task 1...
+
+[*] DICAN mode → INCREMENTAL
+   → Projector: Trainable
+   → All else:  Frozen
+    Step [20/50] Loss: 4.5759 (align=1.888, ord=1.383, anchor=0.000)
+    Step [40/50] Loss: 4.4232 (align=1.827, ord=1.368, anchor=0.000)
+
+[*] DICAN mode → EVAL
+Eval Task 1:   0%|          | 0/12 [00:00<?, ?it/s]Eval Task 1:   8%|▊         | 1/12 [00:03<00:42,  3.90s/it]Eval Task 1:  25%|██▌       | 3/12 [00:04<00:09,  1.07s/it]Eval Task 1:  42%|████▏     | 5/12 [00:07<00:09,  1.38s/it]Eval Task 1:  75%|███████▌  | 9/12 [00:10<00:03,  1.00s/it]Eval Task 1: 100%|██████████| 12/12 [00:10<00:00,  1.15it/s]
+    [Save] Full model  → ./checkpoints/inc_task1_full.pth
+    [Save] Projector   → ./checkpoints/inc_task1_projector.pth
+==================== Task 1 Done (Acc: 73.30%) ====================
+
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 1)...
+    -> Task 0 Acc: 76.25%  |  QWK: 0.7986
+    -> Task 1 Acc: 70.30%  |  QWK: 0.7888
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 58.29%  |  QWK: 0.5055
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 51.61%  |  QWK: 0.3158
+
+   📊 Metrics after Task 1:
+   - Avg Accuracy    : 73.28%
+   - Avg QWK         : 0.7937
+   - BWT             : 0.00%
+   - BWT (QWK)       : 0.0000
+   - Forgetting      : 0.00%
+   - Forgetting (QWK): 0.0000
+   - Task Accuracies : [76.2504498  70.29972752]
+   - Task QWKs       : [0.79861895 0.78875654]
+
+==================== [Phase 2] Incremental Task 2 ====================
+  [Messidor-2] Dropped 4 rows with missing labels.
+[TRAIN] Session 2: Few-shot applied -> 25 samples.
+  [Messidor-2] Dropped 4 rows with missing labels.
+
+  Task 2 Data:
+    Support: 25 samples
+    Query:   175 samples
+[*] Adapting Projector for Task 2...
+
+[*] DICAN mode → INCREMENTAL
+   → Projector: Trainable
+   → All else:  Frozen
+    Step [20/50] Loss: 5.2503 (align=1.883, ord=2.038, anchor=0.000)
+    Step [40/50] Loss: 4.8443 (align=1.865, ord=1.672, anchor=0.000)
+
+[*] DICAN mode → EVAL
+Eval Task 2:   0%|          | 0/6 [00:00<?, ?it/s]Eval Task 2:  17%|█▋        | 1/6 [00:02<00:11,  2.23s/it]Eval Task 2:  33%|███▎      | 2/6 [00:02<00:04,  1.14s/it]Eval Task 2:  83%|████████▎ | 5/6 [00:03<00:00,  1.95it/s]Eval Task 2: 100%|██████████| 6/6 [00:03<00:00,  1.73it/s]
+    [Save] Full model  → ./checkpoints/inc_task2_full.pth
+    [Save] Projector   → ./checkpoints/inc_task2_projector.pth
+==================== Task 2 Done (Acc: 24.57%) ====================
+
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 2)...
+    -> Task 0 Acc: 76.25%  |  QWK: 0.7986
+    -> Task 1 Acc: 70.30%  |  QWK: 0.7888
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 58.29%  |  QWK: 0.5055
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 51.61%  |  QWK: 0.3158
+
+   📊 Metrics after Task 2:
+   - Avg Accuracy    : 68.28%
+   - Avg QWK         : 0.6976
+   - BWT             : 0.00%
+   - BWT (QWK)       : 0.0000
+   - Forgetting      : 0.00%
+   - Forgetting (QWK): 0.0000
+   - Task Accuracies : [76.2504498  70.29972752 58.28571429]
+   - Task QWKs       : [0.79861895 0.78875654 0.50551852]
+
+==================== [Phase 2] Incremental Task 3 ====================
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 225 labels remapped to Global Standard (0, 2, 4).
+[TRAIN] Session 3: Few-shot applied -> 15 samples.
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+
+  Task 3 Data:
+    Support: 15 samples
+    Query:   62 samples
+[*] Adapting Projector for Task 3...
+
+[*] DICAN mode → INCREMENTAL
+   → Projector: Trainable
+   → All else:  Frozen
+    Step [20/50] Loss: 4.7685 (align=1.936, ord=1.507, anchor=0.000)
+    Step [40/50] Loss: 4.1744 (align=1.900, ord=0.990, anchor=0.000)
+
+[*] DICAN mode → EVAL
+Eval Task 3:   0%|          | 0/2 [00:00<?, ?it/s]Eval Task 3:  50%|█████     | 1/2 [00:01<00:01,  1.43s/it]Eval Task 3: 100%|██████████| 2/2 [00:01<00:00,  1.31it/s]
+    [Save] Full model  → ./checkpoints/inc_task3_full.pth
+    [Save] Projector   → ./checkpoints/inc_task3_projector.pth
+==================== Task 3 Done (Acc: 32.26%) ====================
+
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 3)...
+    -> Task 0 Acc: 76.25%  |  QWK: 0.7986
+    -> Task 1 Acc: 70.30%  |  QWK: 0.7888
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 58.29%  |  QWK: 0.5055
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 51.61%  |  QWK: 0.3158
+
+   📊 Metrics after Task 3:
+   - Avg Accuracy    : 64.11%
+   - Avg QWK         : 0.6022
+   - BWT             : 0.00%
+   - BWT (QWK)       : 0.0000
+   - Forgetting      : 0.00%
+   - Forgetting (QWK): 0.0000
+   - Task Accuracies : [76.2504498  70.29972752 58.28571429 51.61290323]
+   - Task QWKs       : [0.79861895 0.78875654 0.50551852 0.31578947]
+
+==================================================
+  🏁 DICAN Training Complete!
+==================================================
+   - Final Avg Acc : 64.11%
+   - Final Avg QWK : 0.6022
+   - Final BWT     : 0.00%
+   - Final FWT     : 60.07%
+   - Final Forget  : 0.00%
+
+   [QWK Details]
+   - BWT (QWK)     : 0.0000
+   - FWT (QWK)     : 0.5367
+   - Forget (QWK)  : 0.0000
+
+   [Accuracy Matrix R]
+    76.25   70.30   58.29   51.61
+    76.25   70.30   58.29   51.61
+    76.25   70.30   58.29   51.61
+    76.25   70.30   58.29   51.61
+
+   [QWK Matrix]
+   0.7986  0.7888  0.5055  0.3158
+   0.7986  0.7888  0.5055  0.3158
+   0.7986  0.7888  0.5055  0.3158
+   0.7986  0.7888  0.5055  0.3158

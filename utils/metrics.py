@@ -82,6 +82,7 @@ class Evaluator:
         
         for task_id in range(self.args.n_tasks):
             if task_id == 0:
+                # self.model.set_eval_mode(task_id=0)
                 loader = self.base_val_loader
             else:
                 _, loader = self.inc_loader_manager.get_incremental_loaders(task_id, mode_override='test')

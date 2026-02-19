@@ -216,3 +216,13 @@ class DICAN_CBM(nn.Module):
         else:
             params = []
         return [p for p in params if p.requires_grad]
+
+    def set_eval_mode(self, task_id=0):
+        self.eval()
+        for p in self.parameters():
+            p.requires_grad = False
+        
+        if task_id == 0:
+            self.projector.mode = 'base'       # Identity
+        else:
+            self.projector.mode = 'incremental'

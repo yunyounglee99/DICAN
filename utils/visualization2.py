@@ -6,7 +6,7 @@ import pandas as pd
 # (각 리스트는 Task 0 학습 후, Task 1 학습 후... 순서의 평균 정확도)
 data = {
     'Session': ['Session 1', 'Session 2', 'Session 3', 'Session 4'],
-    'DICAN (Ours)': [71.39, 57.39, 12.90, 49.64], # Session 3의 드롭은 로그 기반 수치임
+    'DICAN (Ours)': [76.03, 63.76, 51.43, 51.61], # Session 3의 드롭은 로그 기반 수치임
     'L2P': [79.17, 57.59, 37.87, 44.37],
     'DualPrompt': [78.34, 52.28, 37.67, 41.96],
     'LwF': [70.06, 49.35, 19.58, 11.94],
@@ -31,7 +31,7 @@ for model, color, marker in zip(models, colors, markers):
 
 # 3. 그래프 디테일 설정 (논문용)
 plt.title('Average Accuracy Flow across Tasks', fontsize=16, fontweight='bold', pad=20)
-plt.xlabel('Incremental Learning Sessions', fontsize=12)
+plt.xlabel('Learning Sessions', fontsize=12)
 plt.ylabel('Average Accuracy (%)', fontsize=12)
 plt.legend(title='Methods', bbox_to_anchor=(1.05, 1), loc='upper left')
 plt.ylim(0, 90)

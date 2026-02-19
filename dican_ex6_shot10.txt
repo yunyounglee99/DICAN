@@ -1,0 +1,248 @@
+
+==================================================
+🚀 DICAN Training (DDR+FGADR 통합)
+   - Data Root: /root/DICAN_DATASETS
+   - Device: cuda
+   - Concepts: 4
+   - Clusters per concept: 10
+   - Score dim: 12 (Max+Mean+Std)
+   - Head: 12→64→32→16→5 (Residual)
+   - Tasks: 4 (1 base + 3 incremental)
+   - Shot: 10
+   - Adaptation steps: 200
+
+   ★ --skip_base: Base Session 건너뜀 (체크포인트 로드)
+==================================================
+
+[*] Loading Base Data...
+    DDR:   /root/DICAN_DATASETS/DDR
+    FGADR: /root/DICAN_DATASETS/FGADR
+[*] Loading DDR (train) from local disk: /root/DICAN_DATASETS/DDR
+    -> 6260 samples loaded.
+    -> [Note] Discarded 575 samples with label 5 (Ungradable).
+    -> Mask available: 275/6260 images (4.4%)
+[*] Loading DDR (valid) from local disk: /root/DICAN_DATASETS/DDR
+    -> 2503 samples loaded.
+    -> [Note] Discarded 230 samples with label 5 (Ungradable).
+    -> Mask available: 31/2503 images (1.2%)
+[*] Loading FGADR Seg-set (train) from: /root/DICAN_DATASETS/FGADR/Seg-set
+    -> CSV: 1842 entries parsed.
+    -> Mask available: 1566/1566 (100.0%)
+    -> 1566 samples loaded for 'train'.
+[*] Loading FGADR Seg-set (valid) from: /root/DICAN_DATASETS/FGADR/Seg-set
+    -> CSV: 1842 entries parsed.
+    -> Mask available: 276/276 (100.0%)
+    -> 276 samples loaded for 'valid'.
+
+    ✅ Combined Dataset:
+       Train: DDR(6260) + FGADR(1566) = 7826
+       Valid: DDR(2503) + FGADR(276) = 2779
+
+============================================================
+  ★ Skip Base Session — Loading Saved Checkpoints
+============================================================
+  [✓] Model weights loaded: ./checkpoints/phase1c_best.pth
+      (Phase 1-C Best (Head 학습 완료))
+  [✓] Prototypes loaded: ./checkpoints/base_prototypes.pt
+[*] Prototypes loaded from ./checkpoints/base_prototypes.pt
+  [✓] logit_scale restored: 1.8350 (exp: 6.2652)
+
+[Eval] Evaluation after Base Session...
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 0)...
+    -> Task 0 Acc: 76.25%  |  QWK: 0.7986
+    -> Task 1 Acc: 70.30%  |  QWK: 0.7888
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 58.29%  |  QWK: 0.5055
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 51.61%  |  QWK: 0.3158
+   >>> Base Avg Acc: 76.25%
+   >>> Base Avg QWK: 0.7986
+
+🔄 Starting Incremental Phase (3 tasks)
+   Adaptation steps: 200
+
+==================== [Phase 2] Incremental Task 1 ====================
+[TRAIN] Session 1: Few-shot applied -> 50 samples.
+
+  Task 1 Data:
+    Support: 50 samples
+    Query:   367 samples
+[*] Adapting Projector for Task 1...
+
+[*] DICAN mode → INCREMENTAL
+   → Projector: Trainable
+   → All else:  Frozen
+    Step [20/200] Loss: 4.0362 (align=2.014, ord=0.846, anchor=0.000)
+    Step [40/200] Loss: 2.6918 (align=1.343, ord=0.404, anchor=0.000)
+    Step [60/200] Loss: 2.3660 (align=1.379, ord=0.191, anchor=0.000)
+    Step [80/200] Loss: 2.1539 (align=1.399, ord=0.084, anchor=0.000)
+    Step [100/200] Loss: 1.5805 (align=0.945, ord=0.052, anchor=0.000)
+    Step [120/200] Loss: 1.5679 (align=0.974, ord=0.085, anchor=0.000)
+    Step [140/200] Loss: 1.2696 (align=0.753, ord=0.044, anchor=0.000)
+    Step [160/200] Loss: 1.7476 (align=1.241, ord=0.038, anchor=0.000)
+    Step [180/200] Loss: 1.4803 (align=0.960, ord=0.063, anchor=0.000)
+    Step [200/200] Loss: 1.3697 (align=0.891, ord=0.033, anchor=0.000)
+
+[*] DICAN mode → EVAL
+Eval Task 1:   0%|          | 0/12 [00:00<?, ?it/s]Eval Task 1:   8%|▊         | 1/12 [00:03<00:43,  3.95s/it]Eval Task 1:  25%|██▌       | 3/12 [00:04<00:09,  1.08s/it]Eval Task 1:  42%|████▏     | 5/12 [00:07<00:09,  1.37s/it]Eval Task 1:  75%|███████▌  | 9/12 [00:10<00:02,  1.00it/s]Eval Task 1: 100%|██████████| 12/12 [00:10<00:00,  1.14it/s]
+    [Save] Full model  → ./checkpoints/inc_task1_full.pth
+    [Save] Projector   → ./checkpoints/inc_task1_projector.pth
+==================== Task 1 Done (Acc: 74.39%) ====================
+
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 1)...
+    -> Task 0 Acc: 69.45%  |  QWK: 0.6512
+    -> Task 1 Acc: 74.39%  |  QWK: 0.8006
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 50.86%  |  QWK: 0.3141
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 54.84%  |  QWK: 0.0680
+
+   📊 Metrics after Task 1:
+   - Avg Accuracy    : 71.92%
+   - Avg QWK         : 0.7259
+   - BWT             : -6.80%
+   - BWT (QWK)       : -0.1474
+   - Forgetting      : 6.80%
+   - Forgetting (QWK): 0.1474
+   - Task Accuracies : [69.44944225 74.38692098]
+   - Task QWKs       : [0.65117044 0.80058226]
+
+==================== [Phase 2] Incremental Task 2 ====================
+  [Messidor-2] Dropped 4 rows with missing labels.
+[TRAIN] Session 2: Few-shot applied -> 50 samples.
+  [Messidor-2] Dropped 4 rows with missing labels.
+
+  Task 2 Data:
+    Support: 50 samples
+    Query:   175 samples
+[*] Adapting Projector for Task 2...
+
+[*] DICAN mode → INCREMENTAL
+   → Projector: Trainable
+   → All else:  Frozen
+    Step [20/200] Loss: 3.6713 (align=1.789, ord=0.981, anchor=0.000)
+    Step [40/200] Loss: 2.1686 (align=1.292, ord=0.172, anchor=0.000)
+    Step [60/200] Loss: 1.9661 (align=1.207, ord=0.103, anchor=0.000)
+    Step [80/200] Loss: 1.7785 (align=1.074, ord=0.090, anchor=0.000)
+    Step [100/200] Loss: 2.1890 (align=1.513, ord=0.094, anchor=0.000)
+    Step [120/200] Loss: 1.6197 (align=0.965, ord=0.088, anchor=0.000)
+    Step [140/200] Loss: 1.8084 (align=1.161, ord=0.096, anchor=0.000)
+    Step [160/200] Loss: 1.8417 (align=1.216, ord=0.087, anchor=0.000)
+    Step [180/200] Loss: 1.7753 (align=1.199, ord=0.051, anchor=0.000)
+    Step [200/200] Loss: 1.6193 (align=1.034, ord=0.077, anchor=0.000)
+
+[*] DICAN mode → EVAL
+Eval Task 2:   0%|          | 0/6 [00:00<?, ?it/s]Eval Task 2:  17%|█▋        | 1/6 [00:02<00:10,  2.05s/it]Eval Task 2:  33%|███▎      | 2/6 [00:02<00:04,  1.09s/it]Eval Task 2:  83%|████████▎ | 5/6 [00:03<00:00,  2.00it/s]Eval Task 2: 100%|██████████| 6/6 [00:03<00:00,  1.80it/s]
+    [Save] Full model  → ./checkpoints/inc_task2_full.pth
+    [Save] Projector   → ./checkpoints/inc_task2_projector.pth
+==================== Task 2 Done (Acc: 54.29%) ====================
+
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 2)...
+    -> Task 0 Acc: 68.19%  |  QWK: 0.7375
+    -> Task 1 Acc: 59.13%  |  QWK: 0.7860
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 54.29%  |  QWK: 0.4184
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 37.10%  |  QWK: 0.1554
+
+   📊 Metrics after Task 2:
+   - Avg Accuracy    : 60.53%
+   - Avg QWK         : 0.6473
+   - BWT             : -11.66%
+   - BWT (QWK)       : -0.0378
+   - Forgetting      : 11.66%
+   - Forgetting (QWK): 0.0378
+   - Task Accuracies : [68.1899964  59.1280654  54.28571429]
+   - Task QWKs       : [0.73750259 0.78603675 0.41835299]
+
+==================== [Phase 2] Incremental Task 3 ====================
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 225 labels remapped to Global Standard (0, 2, 4).
+[TRAIN] Session 3: Few-shot applied -> 30 samples.
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+
+  Task 3 Data:
+    Support: 30 samples
+    Query:   62 samples
+[*] Adapting Projector for Task 3...
+
+[*] DICAN mode → INCREMENTAL
+   → Projector: Trainable
+   → All else:  Frozen
+    Step [20/200] Loss: 2.6120 (align=1.159, ord=0.813, anchor=0.000)
+    Step [40/200] Loss: 1.8053 (align=0.975, ord=0.311, anchor=0.000)
+    Step [60/200] Loss: 1.4599 (align=0.917, ord=0.062, anchor=0.000)
+    Step [80/200] Loss: 1.3587 (align=0.882, ord=0.019, anchor=0.000)
+    Step [100/200] Loss: 1.3115 (align=0.857, ord=0.010, anchor=0.000)
+    Step [120/200] Loss: 1.2820 (align=0.839, ord=0.007, anchor=0.000)
+    Step [140/200] Loss: 1.2602 (align=0.825, ord=0.006, anchor=0.000)
+    Step [160/200] Loss: 1.2439 (align=0.814, ord=0.005, anchor=0.000)
+    Step [180/200] Loss: 1.2316 (align=0.806, ord=0.005, anchor=0.001)
+    Step [200/200] Loss: 1.2221 (align=0.799, ord=0.004, anchor=0.001)
+
+[*] DICAN mode → EVAL
+Eval Task 3:   0%|          | 0/2 [00:00<?, ?it/s]Eval Task 3:  50%|█████     | 1/2 [00:01<00:01,  1.55s/it]Eval Task 3: 100%|██████████| 2/2 [00:01<00:00,  1.24it/s]
+    [Save] Full model  → ./checkpoints/inc_task3_full.pth
+    [Save] Projector   → ./checkpoints/inc_task3_projector.pth
+==================== Task 3 Done (Acc: 51.61%) ====================
+
+
+[*] DICAN mode → EVAL
+
+[*] Evaluating on All Tasks (Current Session: 3)...
+    -> Task 0 Acc: 47.50%  |  QWK: 0.2626
+    -> Task 1 Acc: 43.32%  |  QWK: 0.3089
+  [Messidor-2] Dropped 4 rows with missing labels.
+    -> Task 2 Acc: 25.14%  |  QWK: -0.0172
+[*] Remapping DRAC22 Labels for Task 3...
+    -> 29 labels remapped to Global Standard (0, 2, 4).
+    -> Task 3 Acc: 51.61%  |  QWK: 0.3512
+
+   📊 Metrics after Task 3:
+   - Avg Accuracy    : 41.89%
+   - Avg QWK         : 0.2264
+   - BWT             : -29.65%
+   - BWT (QWK)       : -0.4877
+   - Forgetting      : 30.99%
+   - Forgetting (QWK): 0.5168
+   - Task Accuracies : [47.4991004  43.32425068 25.14285714 51.61290323]
+   - Task QWKs       : [ 0.26261628  0.30894144 -0.0171815   0.35116279]
+
+==================================================
+  🏁 DICAN Training Complete!
+==================================================
+   - Final Avg Acc : 41.89%
+   - Final Avg QWK : 0.2264
+   - Final BWT     : -29.65%
+   - Final FWT     : 52.75%
+   - Final Forget  : 30.99%
+
+   [QWK Details]
+   - BWT (QWK)     : -0.4877
+   - FWT (QWK)     : 0.4194
+   - Forget (QWK)  : 0.5168
+
+   [Accuracy Matrix R]
+    76.25   70.30   58.29   51.61
+    69.45   74.39   50.86   54.84
+    68.19   59.13   54.29   37.10
+    47.50   43.32   25.14   51.61
+
+   [QWK Matrix]
+   0.7986  0.7888  0.5055  0.3158
+   0.6512  0.8006  0.3141  0.0680
+   0.7375  0.7860  0.4184  0.1554
+   0.2626  0.3089  -0.0172  0.3512
