@@ -30,7 +30,7 @@ for model, color, marker in zip(models, colors, markers):
              marker=marker, markersize=8, linewidth=linewidth, alpha=0.9)
 
 # 3. 그래프 디테일 설정 (논문용)
-plt.title('Average Accuracy Flow across Tasks', fontsize=16, fontweight='bold', pad=20)
+plt.title('Task Accuracy Flow across Tasks', fontsize=16, fontweight='bold', pad=20)
 plt.xlabel('Learning Sessions', fontsize=12)
 plt.ylabel('Average Accuracy (%)', fontsize=12)
 plt.legend(title='Methods', bbox_to_anchor=(1.05, 1), loc='upper left')
