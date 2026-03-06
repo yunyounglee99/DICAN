@@ -126,10 +126,8 @@ A clinician can override concept statistics at inference time and observe determ
 
 **Example:** A fundus image initially misclassified as Grade 2 (ground truth: Grade 3) due to an underestimated hemorrhage (HE) score of 7.70. Overriding HE Max to 15.0 corrects the prediction to Grade 3 with near-certain confidence.
 
-```
-Before intervention:  HE score = 7.70  →  Predicted: Grade 2 ✗
-After intervention:   HE score = 15.0  →  Predicted: Grade 3 ✓
-```
+<img width="3800" height="1700" alt="dican3 drawio" src="https://github.com/user-attachments/assets/01e6ed42-25db-4db7-a308-ccc7bb4ee17a" />
+
 
 ---
 
